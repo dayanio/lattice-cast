@@ -214,6 +214,29 @@ func TestRescanSkipsUnreadableEntries(t *testing.T) {
 	assert.Contains(t, logged, "locked", "Warn 日志应指出被跳过的条目路径")
 }
 
+// TestRescanUnreadableRootKeepsOldIndex 根目录本身不可读（0o000）时 Rescan 应
+// 返回错误且旧索引原样保留（已入库条目仍可 Get），而非静默换成空索引。
+// root 身份下权限检查不生效，跳过（os.Geteuid()==0 守卫）。
+func TestRescanUnreadableRootKeepsOldIndex(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission checks do not apply")
+	}
+	dir := t.TempDir()
+	seedFiles(t, dir, map[string]string{"clip.mp4": "x"})
+	lib := NewLibrary([]string{dir})
+	require.NoError(t, lib.Rescan())
+	hits := lib.Search("clip")
+	require.Len(t, hits, 1)
+	id := hits[0].ID
+
+	require.NoError(t, os.Chmod(dir, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) }) // 还原权限，让 TempDir 清理可删除
+
+	require.Error(t, lib.Rescan(), "根目录本身不可读应令 Rescan 报错")
+	_, ok := lib.Get(id)
+	assert.True(t, ok, "Rescan 失败时应保留旧索引，已入库条目仍可取回")
+}
+
 // TestRescanMissingRootStillErrors 根目录不存在（遍历无法开始）仍返回错误，
 // 不被"跳过不可读条目"的宽容语义吞掉。
 func TestRescanMissingRootStillErrors(t *testing.T) {
