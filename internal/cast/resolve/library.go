@@ -80,7 +80,8 @@ func NewLibrary(dirs []string) *Library {
 //     因此不可能产生目录环（根目录本身是符号链接时先归一化为真实目录）；
 //   - 单个条目不可读（如无权限的子目录/文件）：记 Warn 日志并跳过，其余
 //     内容照常收录，不作为 Rescan 的错误返回；
-//   - 遍历本身无法开始（如某个根目录不存在/不可解析）时仍返回错误。
+//   - 遍历本身无法开始（如某个根目录不存在/不可解析）、或根目录本身不可读
+//     时返回错误，索引保持不变（保留旧索引，避免整库被换成空索引）。
 func (l *Library) Rescan() error {
 	index := make(map[string]Item)
 	for _, dir := range l.dirs {
@@ -94,6 +95,12 @@ func (l *Library) Rescan() error {
 		}
 		err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
+				// 根目录本身不可读（WalkDir 以 err 再次回调根路径）：整库
+				// 无法扫描，返回错误令 Rescan 失败、旧索引原样保留，
+				// 而非走下方宽容路径换上空索引。
+				if path == root {
+					return err
+				}
 				// 单个条目不可读（WalkDir 对读不了的目录/文件以 err 回调）：
 				// 记 Warn 并跳过，扫描继续，不令整趟 Rescan 失败。
 				slog.Warn("rescan: skip unreadable entry", "path", path, "err", err)
