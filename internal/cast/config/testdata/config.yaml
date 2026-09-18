@@ -1,0 +1,19 @@
+# cast-agent 合法配置样例（测试夹具）。
+# 故意省略 mcp_listen 与 media_http_listen，用于断言 Load 的默认值填充。
+media_base_url: http://192.168.1.10:7810
+media_library:
+  - /media/music
+  - /media/movies
+yt_dlp: /usr/local/bin/yt-dlp
+auth_token: test-bearer-token
+renderers:
+  # 静态寻址：host + port 显式给出。
+  living-room-display:
+    room: living-room
+    host: 192.168.1.50
+    port: 7811
+    token: tok-living
+  # 仅 mDNS 发现：host/port 留空。
+  study-display:
+    room: study
+    token: tok-study
