@@ -1,0 +1,4 @@
+/lattice-cast
+*.test
+coverage.out
+.DS_Store
