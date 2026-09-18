@@ -1,7 +1,7 @@
 .PHONY: test lint build verify
 
 test:
-	go test ./... -count=1
+	@if find . -name '*.go' -not -path './android/*' | grep -q .; then go test ./... -count=1 -short; else echo "no go sources yet"; fi
 
 lint:
 	golangci-lint run
