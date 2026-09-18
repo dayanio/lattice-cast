@@ -1,10 +1,12 @@
 package resolve
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -172,6 +174,51 @@ func TestRescanFollowsFileSymlinks(t *testing.T) {
 	assert.Equal(t, "video", hits[0].Kind)
 	assert.Equal(t, wantPath(t, outside, "real.mkv"), hits[0].Path, "收录的是符号链接解析后的真实文件")
 	assert.Empty(t, lib.Search("broken"), "失效符号链接不入库")
+}
+
+// TestRescanSkipsUnreadableEntries 单个不可读子目录（0o000）应被跳过并记
+// Warn 日志：Rescan 仍返回 nil，且收录所有可读文件、不收录不可读目录内的文件。
+// root 身份下权限检查不生效，跳过（任务书要求的 os.Geteuid()==0 守卫）。
+func TestRescanSkipsUnreadableEntries(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission checks do not apply")
+	}
+	dir := t.TempDir()
+	seedFiles(t, dir, map[string]string{"open-a.mp4": "x", "open-b.mkv": "x"})
+	locked := filepath.Join(dir, "locked")
+	require.NoError(t, os.MkdirAll(locked, 0o755))
+	seedFiles(t, locked, map[string]string{"hidden.mp4": "x"})
+	require.NoError(t, os.Chmod(locked, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) }) // 还原权限，让 TempDir 清理可删除
+
+	// 把 slog 默认 logger 指向内存 buffer：既验证 Warn 日志确实产生（含路径），
+	// 又保持 go test 输出整洁。
+	var logBuf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	lib := NewLibrary([]string{dir})
+	require.NoError(t, lib.Rescan(), "不可读子目录应被跳过，而非令整趟扫描失败")
+
+	titles := map[string]bool{}
+	for _, it := range lib.Search("") {
+		titles[it.Title] = true
+	}
+	assert.True(t, titles["open-a"], "可读文件应照常入库")
+	assert.True(t, titles["open-b"], "可读文件应照常入库")
+	assert.False(t, titles["hidden"], "不可读目录内的文件不应入库")
+
+	logged := logBuf.String()
+	assert.Contains(t, logged, "WARN", "不可读条目应以 Warn 级日志呈现")
+	assert.Contains(t, logged, "locked", "Warn 日志应指出被跳过的条目路径")
+}
+
+// TestRescanMissingRootStillErrors 根目录不存在（遍历无法开始）仍返回错误，
+// 不被"跳过不可读条目"的宽容语义吞掉。
+func TestRescanMissingRootStillErrors(t *testing.T) {
+	lib := NewLibrary([]string{filepath.Join(t.TempDir(), "no-such-dir")})
+	require.Error(t, lib.Rescan(), "根目录不存在时 Rescan 应继续报错")
 }
 
 // TestMediaURL baseURL 去尾部斜杠后拼 /media/<id>。
