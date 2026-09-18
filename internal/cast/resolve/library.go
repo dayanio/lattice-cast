@@ -10,6 +10,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -77,7 +78,9 @@ func NewLibrary(dirs []string) *Library {
 //     失效符号链接（解析失败）跳过，不视为错误；
 //   - 目录符号链接不跟随：filepath.WalkDir 默认不进入符号链接目录，
 //     因此不可能产生目录环（根目录本身是符号链接时先归一化为真实目录）；
-//   - 目录不可读/不存在时返回错误。
+//   - 单个条目不可读（如无权限的子目录/文件）：记 Warn 日志并跳过，其余
+//     内容照常收录，不作为 Rescan 的错误返回；
+//   - 遍历本身无法开始（如某个根目录不存在/不可解析）时仍返回错误。
 func (l *Library) Rescan() error {
 	index := make(map[string]Item)
 	for _, dir := range l.dirs {
@@ -91,7 +94,10 @@ func (l *Library) Rescan() error {
 		}
 		err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
-				return err
+				// 单个条目不可读（WalkDir 对读不了的目录/文件以 err 回调）：
+				// 记 Warn 并跳过，扫描继续，不令整趟 Rescan 失败。
+				slog.Warn("rescan: skip unreadable entry", "path", path, "err", err)
+				return nil
 			}
 			if d.IsDir() {
 				return nil
