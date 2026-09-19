@@ -30,7 +30,7 @@ const (
 // 状态机归 Server 所有：Controller 不上报协议态，仅供给
 // Status() 中的位置/时长/标题供 GET /status 组装。
 type Controller interface {
-	Load(ctx context.Context, url, title string) error
+	Load(ctx context.Context, url, title string, positionMS int64) error
 	Pause() error
 	Stop() error
 	SeekTo(ms int64) error
@@ -111,7 +111,9 @@ func (s *Server) getOnly(next http.HandlerFunc) http.HandlerFunc {
 
 // handlePlay 播放指定 URL：成功进入 playing（从 idle/paused/error 任意状态）；
 // Controller.Load 失败时进入 error 态（HTTP 仍 200，应用层报错）。
-// 携 position_ms>0 时在 Load 成功后跟进 seek 到起播位置（续播；尽力而为）。
+// 携 position_ms>0 时把续播位置折叠进 Load（渲染端经 mpv loadfile 的
+// start=+<sec> 起播；mpv 的 loadfile 异步生效，load 后立即 seek 会打在
+// 加载中的文件上被 mpv 拒绝，故不再单独下发 seek）。
 func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	var req adapter.PlayRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -123,16 +125,12 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.ctl.Load(r.Context(), req.URL, req.Title); err != nil {
+	if err := s.ctl.Load(r.Context(), req.URL, req.Title, req.PositionMS); err != nil {
 		s.mu.Lock()
 		s.state, s.title, s.errMsg = stateError, "", err.Error()
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, cmdResp{State: stateError, Error: err.Error()})
 		return
-	}
-
-	if req.PositionMS > 0 {
-		_ = s.ctl.SeekTo(req.PositionMS) // 起播位置尽力而为：失败不影响 playing
 	}
 
 	s.mu.Lock()

@@ -42,7 +42,7 @@ type fakeController struct {
 	pauseErr      error
 }
 
-func (f *fakeController) Load(_ context.Context, u, title string) error {
+func (f *fakeController) Load(_ context.Context, u, title string, positionMS int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failLoadArmed {
@@ -50,7 +50,7 @@ func (f *fakeController) Load(_ context.Context, u, title string) error {
 		return errors.New(f.failLoadMsg)
 	}
 	f.url, f.title = u, title
-	f.positionMS = 0 // 新媒体从头起播
+	f.positionMS = positionMS // 续播位置随 Load 折叠下发（loadfile start）
 	return nil
 }
 
@@ -101,6 +101,12 @@ func (f *fakeController) loaded() (u, title string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.url, f.title
+}
+
+func (f *fakeController) loadedPosition() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.positionMS
 }
 
 func (f *fakeController) volumeLevel() int {
@@ -365,17 +371,25 @@ func TestSeekVolume_PositionFromController(t *testing.T) {
 	assert.Equal(t, adapter.Status{State: "playing", PositionMS: 90000, DurationMS: 5400000, Title: "Interstellar"}, st)
 }
 
-func TestPlay_ResumePosition_SeeksAfterLoad(t *testing.T) {
+func TestPlay_ResumePosition_FoldedIntoLoad(t *testing.T) {
 	ctx := context.Background()
 	ctl, _, c, tgt := newTestServer(t, "s3cret")
 	ctl.setDuration(5400000)
 
-	// 携 position_ms 的 /play：Load 后应跟进 seek 到起播位置（续播）
+	// 携 position_ms 的 /play：位置应随 Load 一起下发（渲染端折进 loadfile
+	// start 起播），而非 Load 后补发 seek——真实 mpv 的 loadfile 异步生效，
+	// 立即 seek 会被打在加载中的文件上而静默失效。
 	_, err := c.Play(ctx, tgt, adapter.PlayRequest{URL: mediaURL, Title: "Interstellar", PositionMS: 30000})
 	require.NoError(t, err)
+	assert.Equal(t, int64(30000), ctl.loadedPosition())
 	st, err := c.Status(ctx, tgt)
 	require.NoError(t, err)
 	assert.Equal(t, int64(30000), st.PositionMS)
+
+	// 不携 position_ms：位置 0（从头起播）
+	_, err = c.Play(ctx, tgt, adapter.PlayRequest{URL: mediaURL, Title: "Interstellar"})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), ctl.loadedPosition())
 }
 
 // TestClientConformance 是渲染端一致性套件：真实 latticecast.Client 外部驱动
