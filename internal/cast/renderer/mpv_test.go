@@ -193,7 +193,7 @@ func TestIpcSeek_MsToAbsoluteSeconds(t *testing.T) {
 	f := newFakeMpv(t)
 	ctl := newTestController(t, f)
 
-	require.NoError(t, ctl.Seek(90000))
+	require.NoError(t, ctl.SeekTo(90000))
 	assert.Contains(t, f.commands(), []any{"seek", 90.0, "absolute"})
 }
 

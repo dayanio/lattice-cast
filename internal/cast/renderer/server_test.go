@@ -62,7 +62,7 @@ func (f *fakeController) Pause() error {
 
 func (f *fakeController) Stop() error { return nil }
 
-func (f *fakeController) Seek(ms int64) error {
+func (f *fakeController) SeekTo(ms int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.positionMS = ms
