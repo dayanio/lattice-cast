@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -154,7 +155,9 @@ func TestRefluxSearchBadJSON(t *testing.T) {
 	assert.Contains(t, err.Error(), "reflux search")
 }
 
-// TestRefluxSearchUnreachable 连接失败：错误包裹底层原因（*url.Error）。
+// TestRefluxSearchUnreachable 连接失败：错误包裹底层原因（保留给调用方），
+// 且文本必须脱敏——*url.Error 的原文内嵌完整请求 URL（含 api_key=<token>），
+// 而这段文本会进审计 JSONL、slog.Warn 与 LLM 转录。
 func TestRefluxSearchUnreachable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	srv.Close() // 端口已关闭 → 连接被拒
@@ -162,8 +165,10 @@ func TestRefluxSearchUnreachable(t *testing.T) {
 	_, err := NewRefluxSource(srv.URL, refluxToken).Search(context.Background(), "q")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "reflux search", "错误应带 reflux search 前缀")
-	var urlErr *url.Error
-	assert.ErrorAs(t, err, &urlErr, "底层连接错误应以 %w 包裹保留给调用方")
+	assert.NotContains(t, err.Error(), refluxToken, "错误文本不得内嵌 api_key")
+	assert.NotContains(t, err.Error(), "api_key=", "错误文本不得携带查询串")
+	var opErr *net.OpError
+	assert.ErrorAs(t, err, &opErr, "底层连接错误应以 %w 保留给调用方")
 }
 
 // TestRefluxStreamURL 拉流地址 = {Base}/Videos/{id}/stream?static=true&api_key=…；
@@ -216,7 +221,22 @@ func TestRefluxStreamURLErrors(t *testing.T) {
 		_, err := NewRefluxSource(srv.URL, refluxToken).StreamURL(context.Background(), refluxMovieID)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "reflux stream")
+		assert.NotContains(t, err.Error(), refluxToken, "错误文本不得内嵌 api_key")
+		assert.NotContains(t, err.Error(), "api_key=", "错误文本不得携带查询串")
 	})
+}
+
+// TestRefluxClientFallbackHasTimeout 零值 RefluxSource 兜底的 HTTP 客户端必须
+// 带超时：http.DefaultClient 无超时，实例半开（接受 TCP 不响应）会把检索/拉流
+// 永久挂起。
+func TestRefluxClientFallbackHasTimeout(t *testing.T) {
+	var zero RefluxSource
+	c := zero.client()
+	require.NotNil(t, c)
+	assert.Greater(t, c.Timeout, time.Duration(0), "兜底客户端必须有超时")
+
+	assert.Equal(t, 10*time.Second, NewRefluxSource("http://base", refluxToken).HC.Timeout,
+		"NewRefluxSource 显式客户端超时应为 10s")
 }
 
 // TestRefluxBaseTrailingSlash Base 带尾部斜杠时应归一化，不得产生双斜杠地址。

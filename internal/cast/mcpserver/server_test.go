@@ -307,6 +307,29 @@ func TestRefluxContentSource(t *testing.T) {
 	assert.True(t, ids["reflux:6334"], "reflux 条目应在合并结果里")
 }
 
+// TestRefluxDownCastPlayAuditRedactsToken reflux 宕机时 cast_play 失败：错误
+// 文本（LLM 转录）与审计 JSONL 都不得出现 reflux api_key——reflux 不可达是
+// 常态故障，传输层错误原文（*url.Error）内嵌完整请求 URL（含 api_key），
+// 明文落盘即凭证泄露。
+func TestRefluxDownCastPlayAuditRedactsToken(t *testing.T) {
+	const refluxTok = "tok-reflux-down-leak"
+	rf := fakereflux.New(refluxTok)
+	downURL := rf.URL
+	rf.Close() // 端口关闭 → 连接被拒（reflux DOWN）
+
+	url, auditPath, _, fake := newStackWith(t, resolve.NewRefluxSource(downURL, refluxTok))
+	f := &fixture{t: t, fake: fake, cs: connect(t, url), auditPath: auditPath}
+
+	got := f.callErr("cast_play", map[string]any{"device": devName, "media_id": "reflux:6334"})
+	assert.NotContains(t, got, refluxTok, "LLM 所见错误文本不得含 api_key")
+	assert.NotContains(t, got, "api_key=", "LLM 所见错误文本不得含查询串")
+
+	b, err := os.ReadFile(auditPath)
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), refluxTok, "审计 JSONL 不得落 api_key 明文")
+	assert.NotContains(t, string(b), "api_key=", "审计 JSONL 不得落查询串")
+}
+
 // ---- cast_play：成功路径 ----
 
 // TestCastPlay_ByMediaID 走 Resolver.ByID（NAS 直链）播放成功：
