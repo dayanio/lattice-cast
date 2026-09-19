@@ -89,6 +89,32 @@ func TestList_OfflineAfterClose(t *testing.T) {
 	assert.Empty(t, got.NowPlaying, "离线时 now_playing 须为空")
 }
 
+// TestList_AnsweringButErroring 配置 token 不符（渲染端回 401 unauthorized）：
+// 渲染端应答了——设备在线但异常，须标 online=true + state="error"，
+// 不得误报离线（否则 LLM 会把配置问题当成"电视不在线"）。
+func TestList_AnsweringButErroring(t *testing.T) {
+	fake := fakerenderer.New("right-token")
+	defer fake.Close()
+
+	cfg := newFakeCfg(fake) // 管理器侧故意配错 token
+	r := cfg.Renderers[devName]
+	r.Token = "wrong-token"
+	cfg.Renderers[devName] = r
+
+	m := newManager(t, cfg)
+
+	devices, err := m.List(context.Background())
+	require.NoError(t, err)
+	require.Len(t, devices, 1)
+
+	got := devices[0]
+	assert.Equal(t, devName, got.Name)
+	assert.Equal(t, devRoom, got.Room, "Room 来自配置")
+	assert.True(t, got.Online, "渲染端应答了（401），设备在线")
+	assert.Equal(t, "error", got.State, "应答但异常 → state=error")
+	assert.Empty(t, got.NowPlaying, "异常时 now_playing 须为空")
+}
+
 // ---- Play / Stop / Status ----
 
 // TestPlay_RoutesToDevice Play 正确路由：Manager 按设备名查当前 host/port/token
