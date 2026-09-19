@@ -6,6 +6,8 @@
 //	search_media(query) → []resolve.Item
 //	cast_play(device, media_id?, url?, title?) → {"status":…,"adapter":"latticecast"}
 //	cast_stop(device) / cast_status(device) → {"status":…}
+//	cast_pause(device) → {"status":…}
+//	cast_seek(device, position_ms) → {"status":…}
 //	cast_volume(device, level 0-100) → {"status":…}
 //
 // 每次调用（含失败）经 audit.Record 落一行 JSONL，agent 署名取自鉴权层。
@@ -25,7 +27,7 @@ import (
 	"github.com/dayanio/lattice-cast/internal/cast/resolve"
 )
 
-// Server 持有 MCP 工具层的全部依赖。经 New 挂载 6 个固定契约的工具，
+// Server 持有 MCP 工具层的全部依赖。经 New 挂载 8 个固定契约的工具，
 // HTTP() 给出套了鉴权中间件的 streamable HTTP 端点。
 type Server struct {
 	mgr   *manager.Manager
@@ -55,6 +57,13 @@ type volumeIn struct {
 	Level  int    `json:"level"`
 }
 
+// seekIn 的 position_ms 无 omitempty：schema 层即为必填（LLM 侧必须显式给出
+// 跳转目标）；负数由 handler 以固定文本 position_out_of_range 拒绝。
+type seekIn struct {
+	Device     string `json:"device"`
+	PositionMS int64  `json:"position_ms"`
+}
+
 type searchIn struct {
 	Query string `json:"query"`
 }
@@ -72,7 +81,7 @@ type playOut struct {
 	Adapter string         `json:"adapter"`
 }
 
-// New 构造 Server 并挂载 6 个工具。SDK v1.8.0 的工具挂载用泛型
+// New 构造 Server 并挂载 8 个工具。SDK v1.8.0 的工具挂载用泛型
 // mcp.AddTool[In, Out]：入参自动反序列化并按推断 schema 校验，返回的
 // 非 nil error 自动包成 IsError 结果（错误文本即 Content[0].Text，
 // LLM 所见的字符串）。
@@ -92,6 +101,12 @@ func New(mgr *manager.Manager, lib *resolve.Library, res *resolve.Resolver, audi
 	mcp.AddTool[deviceIn, statusOut](srv,
 		&mcp.Tool{Name: "cast_stop", Description: "Stop playback on a device."},
 		s.stop)
+	mcp.AddTool[deviceIn, statusOut](srv,
+		&mcp.Tool{Name: "cast_pause", Description: "Pause playback on a device."},
+		s.pause)
+	mcp.AddTool[seekIn, statusOut](srv,
+		&mcp.Tool{Name: "cast_seek", Description: "Seek on a device to an absolute position in milliseconds."},
+		s.seek)
 	mcp.AddTool[volumeIn, statusOut](srv,
 		&mcp.Tool{Name: "cast_volume", Description: "Set device volume 0-100."},
 		s.volume)
@@ -136,7 +151,7 @@ func (s *Server) record(ctx context.Context, tool string, args, out any, err err
 	s.audit.Record(agentFrom(ctx), tool, string(argsJSON), result, err == nil, time.Since(start))
 }
 
-// ---- 六个工具 handler（返回 nil result：由 SDK 以 Out 填充 structuredContent）----
+// ---- 八个工具 handler（返回 nil result：由 SDK 以 Out 填充 structuredContent）----
 
 func (s *Server) listDevices(ctx context.Context, _ *mcp.CallToolRequest, _ listIn) (*mcp.CallToolResult, []manager.Device, error) {
 	start := time.Now()
@@ -193,6 +208,29 @@ func (s *Server) stop(ctx context.Context, _ *mcp.CallToolRequest, in deviceIn) 
 	st, err := s.mgr.Stop(ctx, in.Device)
 	out := statusOut{Status: st}
 	s.record(ctx, "cast_stop", in, out, err, start)
+	return nil, out, err
+}
+
+func (s *Server) pause(ctx context.Context, _ *mcp.CallToolRequest, in deviceIn) (*mcp.CallToolResult, statusOut, error) {
+	start := time.Now()
+	st, err := s.mgr.Pause(ctx, in.Device)
+	out := statusOut{Status: st}
+	s.record(ctx, "cast_pause", in, out, err, start)
+	return nil, out, err
+}
+
+func (s *Server) seek(ctx context.Context, _ *mcp.CallToolRequest, in seekIn) (*mcp.CallToolResult, statusOut, error) {
+	start := time.Now()
+	if in.PositionMS < 0 {
+		// 契约错误文本为裸字符串（LLM 所见即 Content[0].Text），与
+		// cast_volume 的 level 预检同一模式：不下发网络请求。
+		err := errors.New("position_out_of_range")
+		s.record(ctx, "cast_seek", in, statusOut{}, err, start)
+		return nil, statusOut{}, err
+	}
+	st, err := s.mgr.Seek(ctx, in.Device, in.PositionMS)
+	out := statusOut{Status: st}
+	s.record(ctx, "cast_seek", in, out, err, start)
 	return nil, out, err
 }
 
