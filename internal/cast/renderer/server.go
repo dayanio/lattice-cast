@@ -227,11 +227,16 @@ func (s *Server) handleVolume(w http.ResponseWriter, r *http.Request) {
 // 播放中若 Controller 自报 idle（mpv --keep-open 播完 EOF：eof-reached=true、
 // 无媒体在播），Server 状态机随之迁移到 idle（进度与标题清零）——否则
 // /status 会对着已定格的画面谎报 "playing"；该迁移粘滞，直到下一次 /play。
+//
+// Controller.Status() 必须在 s.mu 临界区内读取：若在取锁前读取，旧媒体 EOF
+// 的在途快照会与并发 /play 的新会话状态错配，把新会话错误迁到 idle（粘滞）。
+// 同锁下读取保证状态机判定基于一致快照；本地 unix-socket IPC，短暂阻塞
+// 其他 handler 可接受。
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	cs := s.ctl.Status()
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	cs := s.ctl.Status()
 
 	switch s.state {
 	case stateError:

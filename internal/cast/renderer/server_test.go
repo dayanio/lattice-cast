@@ -2,6 +2,7 @@ package renderer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -540,4 +542,141 @@ func TestContractFixtures(t *testing.T) {
 	code, body = rawDo(t, tsURL, http.MethodGet, "/status", "s3cret", "")
 	assert.Equal(t, http.StatusOK, code)
 	assert.JSONEq(t, string(readFixture(t, "status_error_response.json")), body)
+}
+
+// ---- 回归测试：handleStatus 必须在 s.mu 临界区内读取 Controller.Status() ----
+
+// lockProbeController 是专测锁序的 Controller 假实现（仅服务
+// TestStatusHoldsStateLockAcrossControllerRead）：Status() 进入即定格快照、
+// 随后阻塞在 release 上（模拟慢速本地 IPC、在途 /status）。eof 模拟旧媒体
+// 播完（EOF → 后端自报 idle）；Load() 下发新媒体即清 eof（新会话在播）。
+// 快照在进入时定格（而非返回时）模拟的正是竞态前提——旧媒体 EOF 的在途
+// idle 快照，即便随后有新 Load 也不改写。
+type lockProbeController struct {
+	entered     chan struct{} // Status() 已进入（缓冲发信，不阻塞调用方）
+	release     chan struct{} // 关闭以放行阻塞中的 Status()
+	loadEntered chan struct{} // Load() 已进入
+	eof         bool          // 旧媒体已播完（EOF → 快照 idle）；Load 新媒体即清除
+}
+
+func newLockProbeController() *lockProbeController {
+	return &lockProbeController{
+		entered:     make(chan struct{}, 8),
+		release:     make(chan struct{}),
+		loadEntered: make(chan struct{}, 8),
+	}
+}
+
+func (p *lockProbeController) Load(_ context.Context, _, _ string, _ int64) error {
+	p.eof = false // 新媒体起播，EOF 清除
+	select {
+	case p.loadEntered <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (p *lockProbeController) Pause() error       { return nil }
+func (p *lockProbeController) Stop() error        { return nil }
+func (p *lockProbeController) SeekTo(int64) error { return nil }
+func (p *lockProbeController) Volume(int) error   { return nil }
+
+func (p *lockProbeController) Status() adapter.Status {
+	snap := adapter.Status{State: statePlaying}
+	if p.eof {
+		snap = adapter.Status{State: stateIdle}
+	}
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+	<-p.release // 阻塞直至放行：把 /status 钉在"快照已取、状态机未判"的窗口上
+	return snap
+}
+
+// waitCh 等待信号通道，超时 fatal（防测试自身挂死）。
+func waitCh(t *testing.T, ch <-chan struct{}, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal(msg)
+	}
+}
+
+// TestStatusHoldsStateLockAcrossControllerRead 钉死锁序回归：handleStatus 必须在
+// 持有 s.mu 期间读取 Controller.Status()（修复前在取锁前读取）。
+//
+// 该测试钉住的不变量：
+//  1. /status 阻塞在 ctl.Status() 里时，并发 /play 无法完成状态提交——
+//     两 handler 在"快照已取、状态机未判"窗口上互斥（真竞态难以确定性命中，
+//     以此等价的锁序断言代替）；
+//  2. 因此在途 EOF idle 快照只配对旧会话：旧会话迁 idle 后，新 /play 会话
+//     最终仍是 playing，不会被旧快照错误地拍死在 idle（粘滞错态）。
+//
+// 修复前的形态下本测试失败：/play 会在 Status() 阻塞窗口内完成提交，随后
+// /status 拿到锁看到"新会话 playing + 旧 idle 快照"，把新会话迁到 idle——
+// 最末的新会话 playing 断言落空。
+func TestStatusHoldsStateLockAcrossControllerRead(t *testing.T) {
+	pctl := newLockProbeController()
+	s := NewServer("s3cret", "卧室", "test-renderer", 0, pctl)
+
+	// 旧媒体在播（Server state=playing），随后播完 EOF：后端自报 idle
+	rec := httptest.NewRecorder()
+	s.handlePlay(rec, httptest.NewRequest(http.MethodPost, "/play",
+		strings.NewReader(`{"url":"`+mediaURL+`","title":"Interstellar"}`)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	pctl.eof = true
+
+	// 在途 /status：Status() 一进入即阻塞
+	statusDone := make(chan struct{})
+	recA := httptest.NewRecorder()
+	go func() {
+		defer close(statusDone)
+		s.handleStatus(recA, httptest.NewRequest(http.MethodGet, "/status", nil))
+	}()
+	waitCh(t, pctl.entered, "handleStatus 未调用 Controller.Status()")
+
+	// 并发 /play（新媒体）：Load 下发后、状态提交前应被 s.mu 挡住
+	playDone := make(chan struct{})
+	recB := httptest.NewRecorder()
+	go func() {
+		defer close(playDone)
+		s.handlePlay(recB, httptest.NewRequest(http.MethodPost, "/play",
+			strings.NewReader(`{"url":"`+mediaURL+`2","title":"Interstellar II"}`)))
+	}()
+	waitCh(t, pctl.loadEntered, "并发 /play 未调用 Controller.Load()")
+
+	// 放行前给 /play 一次完成机会：持锁（修复后）它必然完不成，超时放行；
+	// 未持锁（修复前）它会在窗口内完成提交，最末的新会话断言随之落空。
+	select {
+	case <-playDone:
+		t.Log("/play 在 /status 仍阻塞于 Status() 时完成提交（修复前的交错形态）")
+	case <-time.After(time.Second):
+	}
+
+	close(pctl.release) // 放行阻塞中的 Status()
+	waitCh(t, statusDone, "/status 未随放行返回")
+	waitCh(t, playDone, "放行后 /play 仍未返回（未被 s.mu 放行？）")
+
+	// 在途 /status 配对旧会话：旧会话随 EOF 快照迁 idle（eof 迁移语义不变）
+	var stA statusResp
+	require.NoError(t, json.Unmarshal(recA.Body.Bytes(), &stA))
+	assert.Equal(t, stateIdle, stA.State, "旧会话应随在途 EOF 快照迁 idle")
+
+	// 新会话 /play 提交成功
+	assert.JSONEq(t, `{"ok":true,"state":"playing"}`, recB.Body.String())
+
+	// 关键断言：新 /play 会话保持 playing，未被旧 idle 快照迁成 idle
+	var final statusResp
+	recF := httptest.NewRecorder()
+	s.handleStatus(recF, httptest.NewRequest(http.MethodGet, "/status", nil))
+	require.NoError(t, json.Unmarshal(recF.Body.Bytes(), &final))
+	assert.Equal(t, statePlaying, final.State, "新 /play 会话不得被在途 EOF 快照拍死成 idle")
+	assert.Equal(t, "Interstellar II", final.Title)
+
+	s.mu.Lock()
+	got := s.state
+	s.mu.Unlock()
+	assert.Equal(t, statePlaying, got, "Server 状态机最终应为新会话的 playing")
 }
