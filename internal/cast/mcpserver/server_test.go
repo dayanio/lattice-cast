@@ -333,10 +333,10 @@ func TestCastVolume(t *testing.T) {
 	f := newFixture(t)
 
 	got := f.callErr("cast_volume", map[string]any{"device": devName, "level": 101})
-	assert.Contains(t, got, "level_out_of_range")
+	assert.Equal(t, "level_out_of_range", got)
 
 	got = f.callErr("cast_volume", map[string]any{"device": devName, "level": -1})
-	assert.Contains(t, got, "level_out_of_range")
+	assert.Equal(t, "level_out_of_range", got)
 
 	var out struct {
 		Status adapter.Status `json:"status"`
