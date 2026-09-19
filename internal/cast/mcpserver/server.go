@@ -46,6 +46,10 @@ type playIn struct {
 	MediaID string `json:"media_id,omitempty"`
 	URL     string `json:"url,omitempty"`
 	Title   string `json:"title,omitempty"`
+	// PositionMS 起播/续播位置（毫秒，可选）：LLM 续播模式（cast_status →
+	// 带 position_ms 重播）依赖该参数；协议 /play 与 adapter.PlayRequest
+	// 本就携带，此处仅补齐 schema 暴露与透传。
+	PositionMS int64 `json:"position_ms,omitempty"`
 }
 
 type deviceIn struct {
@@ -196,7 +200,7 @@ func (s *Server) doPlay(ctx context.Context, in playIn) (playOut, error) {
 		return playOut{}, err
 	}
 
-	st, err := s.mgr.Play(ctx, in.Device, adapter.PlayRequest{URL: src.URL, Title: in.Title})
+	st, err := s.mgr.Play(ctx, in.Device, adapter.PlayRequest{URL: src.URL, Title: in.Title, PositionMS: in.PositionMS})
 	if err != nil {
 		return playOut{}, err
 	}

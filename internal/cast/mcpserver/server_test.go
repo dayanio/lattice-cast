@@ -285,6 +285,31 @@ func TestCastPlay_ByURL(t *testing.T) {
 	assert.Equal(t, "playing", out.Status.State)
 }
 
+// TestCastPlay_ResumePosition position_ms 随 cast_play 透传到渲染端：LLM 的
+// 续播模式（cast_status → 带 position_ms 重播）依赖该参数（协议 /play 本就
+// 携带 position_ms）。
+func TestCastPlay_ResumePosition(t *testing.T) {
+	f := newFixture(t)
+	var items []resolve.Item
+	f.callOK("search_media", map[string]any{"query": "night"}, &items)
+	require.Len(t, items, 1)
+
+	var out struct {
+		Status adapter.Status `json:"status"`
+	}
+	f.callOK("cast_play", map[string]any{
+		"device": devName, "media_id": items[0].ID, "position_ms": 30000,
+	}, &out)
+	assert.Equal(t, "playing", out.Status.State)
+
+	// 位置真的到达渲染端：Fake 记录 PlayRequest.PositionMS，/status 可读回。
+	var st struct {
+		Status adapter.Status `json:"status"`
+	}
+	f.callOK("cast_status", map[string]any{"device": devName}, &st)
+	assert.Equal(t, int64(30000), st.Status.PositionMS, "position_ms 应透传到渲染端")
+}
+
 // ---- cast_play：参数与解析错误（错误文本即契约） ----
 
 // TestCastPlay_ArgumentRules both/neither 分支的固定错误文本。
