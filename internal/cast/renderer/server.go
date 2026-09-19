@@ -3,6 +3,7 @@
 //   - Server：wire protocol v1 的渲染端 HTTP 服务（docs/protocol.md 唯一权威
 //     定义），持有 idle →(play)→ playing ⇄(pause/play) paused →(stop)→ idle
 //     与 error 状态机（error 仅由 /play 失败进入，粘滞至下一次 /play），
+//     播放中若 Controller 自报 idle（播完 EOF）亦迁到 idle——见 handleStatus，
 //     与测试替身 internal/cast/testsupport/fakerenderer 行为同构；
 //   - Controller：播放后端抽象，位置/时长/标题由其 Status() 供给
 //     （生产实现为 MpvController，测试用内存假实现）；
@@ -223,6 +224,9 @@ func (s *Server) handleVolume(w http.ResponseWriter, r *http.Request) {
 // handleStatus 返回当前状态快照：状态机取 Server 记录，位置/时长/标题取
 // Controller.Status()；error/idle 态信息清零，对齐契约夹具的零值形态；
 // 200 响应不含 ok 字段，error 为空串而非省略。
+// 播放中若 Controller 自报 idle（mpv --keep-open 播完 EOF：eof-reached=true、
+// 无媒体在播），Server 状态机随之迁移到 idle（进度与标题清零）——否则
+// /status 会对着已定格的画面谎报 "playing"；该迁移粘滞，直到下一次 /play。
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	cs := s.ctl.Status()
 
@@ -235,6 +239,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	case stateIdle:
 		writeJSON(w, http.StatusOK, statusResp{State: stateIdle})
 	default: // playing|paused
+		if cs.State == stateIdle {
+			s.state, s.title, s.errMsg = stateIdle, "", ""
+			writeJSON(w, http.StatusOK, statusResp{State: stateIdle})
+			return
+		}
 		writeJSON(w, http.StatusOK, statusResp{
 			State:      s.state,
 			PositionMS: cs.PositionMS,

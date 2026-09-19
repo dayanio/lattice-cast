@@ -36,6 +36,7 @@ type fakeController struct {
 	positionMS int64
 	durationMS int64
 	volume     int
+	ctlState   string // 播放后端自报状态：""（缺省，状态机全归 Server）或 stateIdle（模拟 mpv 播完 EOF / 空闲）
 
 	failLoadArmed bool
 	failLoadMsg   string
@@ -76,12 +77,13 @@ func (f *fakeController) Volume(level int) error {
 	return nil
 }
 
-// Status 返回播放后端快照：State 恒空（状态机归 Server 所有），仅回传
+// Status 返回播放后端快照：State 缺省为空（状态机归 Server 所有），可注入
+// stateIdle 模拟 mpv 播完 EOF（--keep-open 下 eof-reached=true 映射为 idle）；
 // 位置/时长/标题供 /status 组装。
 func (f *fakeController) Status() adapter.Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return adapter.Status{PositionMS: f.positionMS, DurationMS: f.durationMS, Title: f.title}
+	return adapter.Status{State: f.ctlState, PositionMS: f.positionMS, DurationMS: f.durationMS, Title: f.title}
 }
 
 func (f *fakeController) FailNextLoad(msg string) {
@@ -95,6 +97,14 @@ func (f *fakeController) setDuration(ms int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.durationMS = ms
+}
+
+// setControllerState 注入播放后端自报状态（仅 stateIdle 有观察意义：
+// 模拟 mpv 播完 EOF 或空闲；"" 恢复缺省的"状态机全归 Server"）。
+func (f *fakeController) setControllerState(state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ctlState = state
 }
 
 func (f *fakeController) loaded() (u, title string) {
@@ -195,6 +205,57 @@ func TestPlayPauseStop_StateMachine(t *testing.T) {
 	st, err = c.Status(ctx, tgt)
 	require.NoError(t, err)
 	assert.Equal(t, adapter.Status{State: "idle"}, st)
+}
+
+// TestStatus_ControllerEof_TransitionsToIdle 播放后端播完（EOF，--keep-open
+// 下 mpv eof-reached=true → 控制器自报 idle）：/status 须把 Server 状态机一并
+// 迁到 idle（进度与标题清零），不得谎报"还在播"；迁移粘滞——此后 /status 恒为
+// idle，直到下一次 /play。
+func TestStatus_ControllerEof_TransitionsToIdle(t *testing.T) {
+	ctx := context.Background()
+	ctl, _, c, tgt := newTestServer(t, "s3cret")
+	ctl.setDuration(5400000)
+
+	_, err := c.Play(ctx, tgt, adapter.PlayRequest{URL: mediaURL, Title: "Interstellar"})
+	require.NoError(t, err)
+	st, err := c.Status(ctx, tgt)
+	require.NoError(t, err)
+	assert.Equal(t, adapter.Status{State: "playing", DurationMS: 5400000, Title: "Interstellar"}, st)
+
+	// 播放后端到达 EOF：控制器自报 idle
+	ctl.setControllerState(stateIdle)
+
+	st, err = c.Status(ctx, tgt)
+	require.NoError(t, err)
+	assert.Equal(t, adapter.Status{State: "idle"}, st, "EOF 后 wire 状态应为 idle（进度与标题清零）")
+
+	// 迁移粘滞：再次 /status 仍 idle，不得回 playing
+	st, err = c.Status(ctx, tgt)
+	require.NoError(t, err)
+	assert.Equal(t, adapter.Status{State: "idle"}, st)
+
+	// paused 态同理：暂停中播完后端空转也须落到 idle
+	ctl.setControllerState("") // 后端恢复正常上报（模拟新的 load 之前）
+	_, err = c.Play(ctx, tgt, adapter.PlayRequest{URL: mediaURL, Title: "Interstellar"})
+	require.NoError(t, err)
+	_, err = c.Pause(ctx, tgt)
+	require.NoError(t, err)
+	st, err = c.Status(ctx, tgt)
+	require.NoError(t, err)
+	require.Equal(t, "paused", st.State)
+
+	ctl.setControllerState(stateIdle)
+	st, err = c.Status(ctx, tgt)
+	require.NoError(t, err)
+	assert.Equal(t, adapter.Status{State: "idle"}, st, "paused 下控制器自报 idle 同样迁移")
+
+	// 新一次 /play 显然重置：playing 恢复（Fake 的 durationMS 未清，仍在）
+	ctl.setControllerState("")
+	_, err = c.Play(ctx, tgt, adapter.PlayRequest{URL: mediaURL, Title: "Interstellar"})
+	require.NoError(t, err)
+	st, err = c.Status(ctx, tgt)
+	require.NoError(t, err)
+	assert.Equal(t, adapter.Status{State: "playing", DurationMS: 5400000, Title: "Interstellar"}, st)
 }
 
 func TestUnauthorized_WrongOrMissingToken(t *testing.T) {
