@@ -146,8 +146,9 @@ func (m *MpvController) Stop() error {
 	return err
 }
 
-// Seek 跳转到绝对位置：毫秒 → 秒后 seek <sec> absolute。
-func (m *MpvController) Seek(ms int64) error {
+// SeekTo 跳转到绝对位置：毫秒 → 秒后 seek <sec> absolute。
+// （不命名 Seek，避免与 io.Seeker 的 stdmethods 惯例冲突。）
+func (m *MpvController) SeekTo(ms int64) error {
 	_, err := m.command("seek", float64(ms)/1000.0, "absolute")
 	return err
 }

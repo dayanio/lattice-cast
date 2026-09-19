@@ -33,7 +33,7 @@ type Controller interface {
 	Load(ctx context.Context, url, title string) error
 	Pause() error
 	Stop() error
-	Seek(ms int64) error
+	SeekTo(ms int64) error
 	Volume(level int) error
 	Status() adapter.Status
 }
@@ -132,7 +132,7 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.PositionMS > 0 {
-		_ = s.ctl.Seek(req.PositionMS) // 起播位置尽力而为：失败不影响 playing
+		_ = s.ctl.SeekTo(req.PositionMS) // 起播位置尽力而为：失败不影响 playing
 	}
 
 	s.mu.Lock()
@@ -192,7 +192,7 @@ func (s *Server) handleSeek(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	if state == statePlaying || state == statePaused {
-		if err := s.ctl.Seek(req.PositionMS); err != nil {
+		if err := s.ctl.SeekTo(req.PositionMS); err != nil {
 			writeJSON(w, http.StatusOK, cmdResp{State: state, Error: err.Error()})
 			return
 		}
