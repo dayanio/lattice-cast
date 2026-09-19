@@ -1,0 +1,65 @@
+# LatticeCast 渲染端（Apple TV / tvOS + AVPlayer）
+# 生成：cd tvos && xcodegen generate
+name: LatticeCastRenderer
+options:
+  bundleIdPrefix: io.lattice
+  deploymentTarget:
+    tvOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  # 轻量 HTTP server（纯 Swift、零传递依赖、tvOS 支持）。
+  # 固定 stable 分支 revision，保证构建可复现。
+  Swifter:
+    url: https://github.com/httpswift/swifter
+    revision: 1e4f51c92d7ca486242d8bf0722b99de2c3531aa
+targets:
+  LatticeCastRenderer:
+    type: application
+    platform: tvOS
+    sources:
+      - path: LatticeCastRenderer
+    dependencies:
+      - package: Swifter
+    info:
+      path: LatticeCastRenderer/Info.plist
+      properties:
+        CFBundleDisplayName: LatticeCast
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        # 渲染端既是局域网 HTTP 服务端（本机 127.0.0.1 回环自测），
+        # 又要自行拉流播放 agent 下发的 http:// 媒体直链（NAS/HLS）。
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoadsForMedia: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.lattice.cast.renderer
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "3"
+        SWIFT_VERSION: "5.10"
+  LatticeCastRendererTests:
+    type: bundle.unit-test
+    platform: tvOS
+    sources:
+      - path: LatticeCastRendererTests
+    dependencies:
+      - target: LatticeCastRenderer
+    settings:
+      base:
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/LatticeCastRenderer.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/LatticeCastRenderer
+        BUNDLE_LOADER: $(TEST_HOST)
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  LatticeCastRenderer:
+    build:
+      targets:
+        LatticeCastRenderer: all
+        LatticeCastRendererTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - LatticeCastRendererTests
