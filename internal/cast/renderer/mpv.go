@@ -36,18 +36,22 @@ const (
 // 以空闲模式常驻，经 JSON IPC（按行分隔的 JSON 对象）下发 loadfile/pause/
 // stop/seek/volume 并轮询 time-pos/duration/pause/media-title 等属性。
 type MpvController struct {
-	sockPath string // mpv --input-ipc-server 的 unix socket 路径
+	binPath   string   // 解析后的 mpv 可执行路径；空 = 测试直连既有 socket（不拥有进程、不参与重生）
+	extraArgs []string // 常驻基础旗标之后的附加旗标（每个 epoch 按同一形态拉起）
 
-	tmpDir   string    // socket 所在临时目录（进程归我们管时非空，Close 时清理）
-	cmd      *exec.Cmd // 常驻 mpv 进程（测试直连 socket 时为 nil）
+	sockPath string // 当前 epoch 的 --input-ipc-server unix socket 路径
+
+	tmpDir   string    // 当前 epoch socket 所在临时目录（进程归我们管时非空，换代/Close 时清理）
+	cmd      *exec.Cmd // 当前 epoch 的 mpv 进程（测试直连 socket 时为 nil）
 	reapDone chan struct{}
-	// reaper（独占 cmd.Wait）完成信号：Close 只 kill 不 Wait，据它同步收尾
+	// reaper（独占 cmd.Wait）完成信号：Close/重生只 kill 不 Wait，据它同步收尾
 	// （带超时兜底）；nil 表示无进程可等（测试直连 / 已 Close），保证幂等。
 
-	mu   sync.Mutex
-	conn net.Conn      // IPC 连接（懒建立，断线重连）
-	br   *bufio.Reader // 与 conn 绑定的行读取器（跨命令复用缓冲）
-	id   int64         // request_id 自增，用于响应关联
+	mu     sync.Mutex
+	conn   net.Conn      // IPC 连接（懒建立，断线重连）
+	br     *bufio.Reader // 与 conn 绑定的行读取器（跨命令复用缓冲）
+	id     int64         // request_id 自增，用于响应关联
+	closed bool          // Close 已调用：此后不得再重生新进程（防 Close 后复活）
 }
 
 // NewMpvController 校验 mpv 可用、拉起常驻 mpv 进程并等待 IPC socket 就绪。
@@ -58,45 +62,14 @@ func NewMpvController(mpvBin string) (*MpvController, error) {
 
 // newMpvController 是构造主体；extraArgs 追加在常驻基础旗标之后（生产传
 // --fullscreen；真实进程测试传 --vo=null --ao=null 等保持无头不侵入）。
+// 构造即拉起首个 epoch；此后的进程生命周期见 ensureProcessLocked（惰性重生）。
 func newMpvController(mpvBin string, extraArgs ...string) (*MpvController, error) {
 	path, err := exec.LookPath(mpvBin)
 	if err != nil {
 		return nil, errors.New("mpv not found: brew install mpv (macOS) / apt install mpv (Debian)")
 	}
-	tmpDir, err := os.MkdirTemp("", "latticecast-mpv-")
-	if err != nil {
-		return nil, fmt.Errorf("create mpv tmpdir: %w", err)
-	}
-	m := &MpvController{
-		sockPath: filepath.Join(tmpDir, "mpv-ipc.sock"),
-		tmpDir:   tmpDir,
-	}
-	args := []string{
-		"--input-ipc-server=" + m.sockPath,
-		"--idle=yes",      // 无媒体时驻留
-		"--keep-open=yes", // 播完不退出（eof 后回 idle 而非退出进程）
-	}
-	args = append(args, extraArgs...)
-	m.cmd = exec.Command(path, args...)
-	// 静默 mpv 自身输出：测试要求 pristine output，排障靠 IPC 层报错。
-	m.cmd.Stdout = io.Discard
-	m.cmd.Stderr = io.Discard
-	if err := m.cmd.Start(); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		return nil, fmt.Errorf("start mpv %s: %w", path, err)
-	}
-	// reaper 独占 cmd.Wait（exec.Cmd 的 Wait 不允许并发调用）：mpv 死亡时
-	// 记日志收尸，避免僵尸进程；Close 经 reapDone 与之同步，不二次 Wait。
-	cmd := m.cmd
-	done := make(chan struct{})
-	m.reapDone = done
-	go func() {
-		defer close(done)
-		err := cmd.Wait()
-		slog.Warn("mpv exited", "err", err) // kill 停机时为 signal: killed，属预期
-	}()
-	if err := m.waitSocket(ipcBootTimeout); err != nil {
-		_ = m.Close()
+	m := &MpvController{binPath: path, extraArgs: extraArgs}
+	if err := m.spawn(); err != nil {
 		return nil, err
 	}
 	return m, nil
@@ -110,8 +83,11 @@ func newIpcController(sockPath string) *MpvController {
 // Close 断开 IPC、杀掉 mpv 进程并清理临时目录（幂等：重复 Close 时进程
 // 字段已清空，直接落到目录清理收尾）。Wait 由 reaper 独占——这里只 kill，
 // 再等 reaper 收尸（超时兜底则放弃等待，进程由 reaper 迟缓收尾）。
+// 终止的是"当前 epoch"：若此前发生过惰性重生，杀的就是重生后的进程。
+// Close 后不再重生（closed 闸，防关停路径被并发 Load 复活进程）。
 func (m *MpvController) Close() error {
 	m.mu.Lock()
+	m.closed = true
 	m.disconnectLocked()
 	cmd := m.cmd
 	done := m.reapDone
@@ -135,6 +111,126 @@ func (m *MpvController) Close() error {
 	return nil
 }
 
+// ---- 进程 epoch 管理（惰性重生）----
+//
+// mpv 进程按 epoch 计：每个 epoch = 一次 spawn 产出的 (tmpdir, socket, cmd,
+// reaper)。用户在 mpv 窗口按 q 或 mpv 崩溃都会终结当前 epoch——此前渲染端
+// 会就此"变砖"（socket 拒连，所有 /play 永久失败）；现在 Load 在进入时经
+// ensureProcessLocked 确认 epoch 存活，已死则换代重生。换代与 reaper/Close
+// 的并发安全：reaper 独占 cmd.Wait，任何路径只 Kill 不 Wait；Close 与重生
+// 在 mu 下串行读写 epoch 字段，Close 置 closed 闸后不再重生。
+
+// spawn 拉起一个全新的 mpv epoch（spawnLocked 的加锁包装）。
+func (m *MpvController) spawn() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.spawnLocked()
+}
+
+// spawnLocked 拉起一个全新的 mpv epoch：新 tmpdir/socket → 常驻进程 →
+// reaper → 等待 IPC socket 就绪；未就绪或启动失败则按 epoch 清理后上抛。
+// 须持有 m.mu。
+func (m *MpvController) spawnLocked() error {
+	tmpDir, err := os.MkdirTemp("", "latticecast-mpv-")
+	if err != nil {
+		return fmt.Errorf("create mpv tmpdir: %w", err)
+	}
+	m.tmpDir = tmpDir
+	m.sockPath = filepath.Join(tmpDir, "mpv-ipc.sock")
+	args := []string{
+		"--input-ipc-server=" + m.sockPath,
+		"--idle=yes",      // 无媒体时驻留
+		"--keep-open=yes", // 播完不退出（eof 后回 idle 而非退出进程）
+	}
+	args = append(args, m.extraArgs...)
+	m.cmd = exec.Command(m.binPath, args...)
+	// 静默 mpv 自身输出：测试要求 pristine output，排障靠 IPC 层报错。
+	m.cmd.Stdout = io.Discard
+	m.cmd.Stderr = io.Discard
+	if err := m.cmd.Start(); err != nil {
+		m.killEpochLocked()
+		return fmt.Errorf("start mpv %s: %w", m.binPath, err)
+	}
+	// reaper 独占 cmd.Wait（exec.Cmd 的 Wait 不允许并发调用）：mpv 死亡时
+	// 记日志收尸，避免僵尸进程；Close/重生经 reapDone 与之同步，不二次 Wait。
+	cmd := m.cmd
+	done := make(chan struct{})
+	m.reapDone = done
+	go func() {
+		defer close(done)
+		err := cmd.Wait()
+		slog.Warn("mpv exited", "err", err) // kill 停机时为 signal: killed，属预期
+	}()
+	if err := m.waitSocket(ipcBootTimeout); err != nil {
+		m.killEpochLocked()
+		return err
+	}
+	return nil
+}
+
+// ensureProcessLocked 确保当前 epoch 的 mpv 存活；reaper 已观察到退出则惰性
+// 重生（Load 专用入口）。Status 是只读路径不走这里（mpv 死时如实报 idle，
+// 不得凭空拉起窗口）；Pause/Stop/SeekTo/Volume 也不重生——死进程上干净失败，
+// 由下一次 /play 恢复。须持有 m.mu。
+func (m *MpvController) ensureProcessLocked() error {
+	if m.binPath == "" {
+		return nil // 测试直连 socket 模式：不拥有进程
+	}
+	if m.closed {
+		return errors.New("mpv controller closed")
+	}
+	if m.cmd != nil && m.reapDone != nil {
+		select {
+		case <-m.reapDone: // reaper 已收尸：进程确死，走重生
+		default:
+			return nil // 本 epoch 存活
+		}
+	}
+	return m.respawnLocked()
+}
+
+// respawnLocked 丢弃当前 epoch（Kill、有界等 reaper 收尸、清 tmpdir）并拉起
+// 全新 epoch。须持有 m.mu。
+func (m *MpvController) respawnLocked() error {
+	if m.binPath == "" {
+		return nil // 测试直连 socket 模式：无可重生之物
+	}
+	if m.closed {
+		return errors.New("mpv controller closed")
+	}
+	m.killEpochLocked()
+	return m.spawnLocked()
+}
+
+// respawn 是 respawnLocked 的加锁包装（Load 的连接级故障重试路径用）。
+func (m *MpvController) respawn() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.respawnLocked()
+}
+
+// killEpochLocked 终止并清空当前 epoch：断开 IPC、Kill 进程（不 Wait——
+// reaper 独占 cmd.Wait）、有界等待收尸、清理 tmpdir 并清空进程字段。幂等。
+// 须持有 m.mu。
+func (m *MpvController) killEpochLocked() {
+	done := m.reapDone
+	if m.cmd != nil && m.cmd.Process != nil {
+		_ = m.cmd.Process.Kill() // 已退出时 ErrProcessDone，忽略
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(closeReapTimeout):
+		}
+	}
+	m.disconnectLocked()
+	m.cmd, m.reapDone = nil, nil
+	if m.tmpDir != "" {
+		_ = os.RemoveAll(m.tmpDir)
+		m.tmpDir = ""
+	}
+}
+
 // ---- Controller 接口 ----
 
 // Load 播放指定 URL：loadfile <url> replace；positionMS>0 时把续播位置折叠为
@@ -147,7 +243,31 @@ func (m *MpvController) Close() error {
 // set force-media-title <title>。mpv 的 media-title 属性本身只读
 // （实测 0.41 报 error running command），force-media-title 是官方的
 // 展示标题覆写位，media-title 随之生效。
+//
+// 进程管理：Load 是唯一的惰性复活入口——先 ensureProcess 确认当前 epoch
+// 存活（用户 q 退出 / 崩溃后在此重拉全新 mpv，首次 Load 即成功）；若进程在
+// 检查与命令之间死亡（reaper 收尸未落、socket 先拒连的窗口），命令返回
+// 连接级故障时换代重试一次。命令级错误（如 invalid parameter）不触发重生。
 func (m *MpvController) Load(_ context.Context, url, title string, positionMS int64) error {
+	m.mu.Lock()
+	err := m.ensureProcessLocked()
+	m.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	if err := m.load(url, title, positionMS); !isConnErr(err) {
+		return err
+	}
+	// epoch 在检查与命令之间死亡：换代重生后重试一次
+	if err := m.respawn(); err != nil {
+		return err
+	}
+	return m.load(url, title, positionMS)
+}
+
+// load 仅下发 loadfile（与可选的标题覆写），不含进程管理。
+func (m *MpvController) load(url, title string, positionMS int64) error {
 	args := []any{"loadfile", url, "replace"}
 	if positionMS > 0 {
 		sec := strconv.FormatFloat(float64(positionMS)/1000.0, 'f', -1, 64)

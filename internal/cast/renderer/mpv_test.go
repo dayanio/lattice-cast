@@ -438,3 +438,71 @@ func TestMpvIntegration_ResumePosition(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// TestMpvIntegration_RespawnAfterQuit 是真实 mpv 的"用户按 q 退出后必须能
+// 复活"回归（线上事故：mpv 进程一生只拉起一次，用户 q 退出后 socket 拒连，
+// 此后每个 /play 永久失败，渲染端"变砖"直到整个进程重启）。无头启动
+//（--vo=null --ao=null）。契约：
+//   - 外部杀死进程后，Status 恒 idle（只读路径不触发复活）；
+//   - 下一次 Load 按需重拉全新 mpv epoch（socket/tmpdir 换代），首次即成功；
+//   - Close 只杀当前 epoch、清当前 tmpdir（reaper 独占 Wait 不受换代影响）。
+func TestMpvIntegration_RespawnAfterQuit(t *testing.T) {
+	if _, err := exec.LookPath("mpv"); err != nil {
+		t.Skip("mpv 未安装，跳过真实进程集成测试")
+	}
+
+	media := writeSineWAV(t, 60)
+	ctl, err := newMpvController("mpv", "--vo=null", "--ao=null")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ctl.Close() })
+
+	// 初始 epoch 播放正常
+	require.NoError(t, ctl.Load(context.Background(), media, "正弦波", 0))
+
+	ctl.mu.Lock()
+	oldDir := ctl.tmpDir
+	cmd, done := ctl.cmd, ctl.reapDone
+	ctl.mu.Unlock()
+	require.NotNil(t, cmd)
+	require.NotEmpty(t, oldDir)
+
+	// 模拟用户 q / 崩溃：外部杀死进程，等 reaper 观察到退出
+	require.NoError(t, cmd.Process.Kill())
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reaper 5s 内未观察到 mpv 退出")
+	}
+
+	// 死亡期间 Status 恒 idle（只读路径，不得复活）
+	st := ctl.Status()
+	assert.Equal(t, adapter.Status{State: "idle"}, st)
+
+	// 复活入口：退出后的第一次 Load 必须成功，且落在全新 epoch 上
+	require.NoError(t, ctl.Load(context.Background(), media, "正弦波", 0))
+
+	ctl.mu.Lock()
+	newDir := ctl.tmpDir
+	ctl.mu.Unlock()
+	assert.NotEqual(t, oldDir, newDir, "重生必须换新 tmpdir/socket epoch")
+
+	// 新 epoch 真的在播：媒体已加载（时长即自产 WAV 的精确 60s）
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		st = ctl.Status()
+		if st.State == "playing" && st.DurationMS == 60000 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("重生后应能播放自产媒体，3s 内始终为 %+v", st)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Close 仍只杀当前 epoch（不与 reaper 双重 Wait、不碰已清理的旧目录）
+	require.NoError(t, ctl.Close())
+	ctl.mu.Lock()
+	dirAfterClose := ctl.tmpDir
+	ctl.mu.Unlock()
+	assert.Empty(t, dirAfterClose, "Close 应清空当前 epoch 的 tmpdir")
+}
