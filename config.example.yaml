@@ -1,0 +1,38 @@
+# lattice-cast 配置样例：复制为 config.yaml 后按需修改。
+# 字段语义见 internal/cast/config/config.go；未知字段会启动报错（严格解析）。
+
+# MCP 端点监听地址（LLM 客户端经此访问 6 个 cast 工具）；省略时默认 ":7800"。
+mcp_listen: ":7800"
+
+# 媒体 HTTP 服务监听地址（渲染端从这里拉流）；省略时默认 "0.0.0.0:7810"。
+media_http_listen: "0.0.0.0:7810"
+
+# 渲染端访问媒体服务的基址：必填，须填本机内网 IP（渲染端在别的设备上，
+# 不能写 127.0.0.1）。审计日志固定写在进程工作目录 lattice-cast.audit.jsonl。
+media_base_url: http://192.168.1.10:7810
+
+# NAS 媒体目录列表：递归扫描 mp4/mkv/mov/mp3/flac/wav/m4a/jpg/png。
+media_library:
+  - /media/music
+  - /media/movies
+
+# yt-dlp 可执行文件路径；留空 = 禁用 YouTube 播放（播 YouTube 会报 youtube_disabled）。
+yt_dlp: /usr/local/bin/yt-dlp
+
+# MCP Bearer token（v1 为静态 token）：必填，LLM 客户端请求须带
+# Authorization: Bearer <token>；请换成足够长的随机串。
+auth_token: change-me-to-a-long-random-token
+
+# 渲染端列表：必填至少一条；key = mDNS 实例名 = 设备身份。
+renderers:
+  # 卧室电视：host + port 显式给出（静态寻址，无组播环境也可用）；
+  # token 须与渲染端 APK 一致。
+  bedroom-tv:
+    room: 卧室
+    host: 192.168.1.50
+    port: 7811
+    token: tok-bedroom
+  # 仅 mDNS 发现：host/port 留空，地址由发现结果填充（token 仍取自配置）。
+  study-display:
+    room: study
+    token: tok-study
