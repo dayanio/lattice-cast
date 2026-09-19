@@ -1,0 +1,6 @@
+# XcodeGen 生成物（构建前先 `xcodegen generate`）
+*.xcodeproj
+xcuserdata/
+DerivedData/
+*.ipa
+*.dSYM.zip
