@@ -61,12 +61,14 @@ final class PlaybackControllerTests: XCTestCase {
     }
 
     func testVolumeScalesToPlayerVolume() {
+        XCTAssertFalse(ctl.player.isMuted, "tvOS 上 AVPlayer 即音频通路，默认不得静音")
         XCTAssertNil(ctl.volume(level: 42))
         XCTAssertEqual(ctl.player.volume, 0.42, accuracy: 0.001)
         XCTAssertNil(ctl.volume(level: 0))
         XCTAssertEqual(ctl.player.volume, 0.0, accuracy: 0.001)
         XCTAssertNil(ctl.volume(level: 100))
         XCTAssertEqual(ctl.player.volume, 1.0, accuracy: 0.001)
+        XCTAssertFalse(ctl.player.isMuted, "volume 调节不得顺带静音")
     }
 
     func testInvalidURLReportsError() {
@@ -82,6 +84,63 @@ final class PlaybackControllerTests: XCTestCase {
         let st = ctl.status()
         XCTAssertEqual(st.positionMS, 0)
         XCTAssertEqual(st.durationMS, 0)
+    }
+
+    // MARK: - 旧 item 回调隔离（generation guard + current-item 身份校验）
+
+    /// 旧 item 的迟到播完通知不得杀死新会话（服务端会把"控制器自报 idle"翻译成
+    /// eof→idle 迁移，误触发即掐断刚 /play 的新媒体——T19 的反面事故）。
+    func testStaleEndNotificationFromPreviousItemDoesNotKillNewSession() throws {
+        _ = ctl.load(url: try sampleURL().absoluteString, title: "A", positionMS: 0)
+        XCTAssertTrue(waitUntil(timeout: 10) { self.ctl.status().state == "playing" })
+        let itemA = ctl.player.currentItem
+        XCTAssertNotNil(itemA)
+
+        _ = ctl.load(url: try sampleURL().absoluteString, title: "B", positionMS: 0)
+        XCTAssertTrue(waitUntil(timeout: 10) { self.ctl.status().state == "playing" })
+
+        // 模拟旧 item A 的迟到播完通知：block observer 按 object 匹配仍会送达旧
+        // handler（除非显式 removeObserver），generation guard 须忽略它
+        NotificationCenter.default.post(name: NSNotification.Name.AVPlayerItemDidPlayToEndTime, object: itemA)
+
+        XCTAssertEqual(ctl.status().state, "playing", "旧 item 的 EOF 不得让新会话迁 idle")
+
+        // 当前 item 自然播完仍应正常 EOF→idle（guard 不误伤当前会话）
+        XCTAssertTrue(waitUntil(timeout: 15) { self.ctl.status().state == "idle" }, "新 item 播完仍应 EOF→idle")
+    }
+
+    /// 旧 item 的失败回调不得清空当前 item（KVO 失败处理须校验"失败者仍是 current"）。
+    func testStaleItemFailureDoesNotClearCurrentItem() throws {
+        // 构造一个必然失败的 item（不存在的文件）。item 只有挂到 player 上才会
+        // 开始评估状态（否则永远 .unknown），故用一次性 probe player 触发。
+        let broken = AVPlayerItem(url: URL(fileURLWithPath: "/nonexistent/stale.mp4"))
+        let probe = AVPlayer()
+        probe.isMuted = true
+        probe.replaceCurrentItem(with: broken)
+        XCTAssertTrue(waitUntil(timeout: 10) { broken.status == .failed })
+        probe.replaceCurrentItem(with: nil)
+
+        _ = ctl.load(url: try sampleURL().absoluteString, title: "B", positionMS: 0)
+        XCTAssertTrue(waitUntil(timeout: 10) { self.ctl.status().state == "playing" })
+        let good = ctl.player.currentItem
+        XCTAssertNotNil(good)
+
+        // 注入旧 item 的失败回调：旧 generation
+        ctl.handleItemStatus(broken, generation: -1)
+        XCTAssertEqual(ctl.status().state, "playing", "旧 generation 的失败不得影响新会话")
+        XCTAssertTrue(ctl.player.currentItem === good, "旧 item 失败不得清空当前 item")
+
+        // 注入旧 item 的失败回调：generation 相同但 item 非 current（身份校验兜底）
+        ctl.handleItemStatus(broken, generation: ctl.currentGeneration)
+        XCTAssertEqual(ctl.status().state, "playing")
+        XCTAssertTrue(ctl.player.currentItem === good)
+    }
+
+    /// 当前 item 加载失败（源不可达）→ 自报 idle 的真实 KVO 路径仍须工作。
+    func testCurrentItemFailureReportsIdle() throws {
+        let brokenURL = URL(fileURLWithPath: "/nonexistent/current.mp4")
+        XCTAssertNil(ctl.load(url: brokenURL.absoluteString, title: "x", positionMS: 0))
+        XCTAssertTrue(waitUntil(timeout: 10) { self.ctl.status().state == "idle" }, "当前 item 加载失败应自报 idle")
     }
 
     /// EOF → idle 的线上形态：真实 Controller + RendererServer，

@@ -39,12 +39,20 @@ final class PlaybackController: PlaybackControlling {
     let player = AVPlayer()
 
     private let lock = NSLock()
+    private var generation = 0
     private var eofReached = false
     private var itemFailed = false
     private var durationMS: Int64 = 0
     private var mediaTitle = ""
     private var endObserver: NSObjectProtocol?
     private var statusObservation: NSKeyValueObservation?
+    private var currentItemRef: AVPlayerItem?
+
+    /// 当前会话代数（测试注入旧回调用，@testable 读取）。
+    var currentGeneration: Int {
+        lock.lock(); defer { lock.unlock() }
+        return generation
+    }
 
     func load(url: String, title: String, positionMS: Int64) -> String? {
         guard let u = URL(string: url), u.scheme != nil, u.host != nil || u.isFileURL else {
@@ -52,32 +60,35 @@ final class PlaybackController: PlaybackControlling {
         }
 
         lock.lock()
+        generation += 1
         eofReached = false
         itemFailed = false
         durationMS = 0
         mediaTitle = title
         lock.unlock()
+        detachObservers() // 旧 item 的 block 通知 token/KVO 必须显式摘除，不能只覆盖引用
 
         let asset = AVURLAsset(url: u)
         let item = AVPlayerItem(asset: asset)
 
-        // 播完 EOF：置位后 status() 自报 idle（等价 mpv eof-reached → idle）
+        lock.lock()
+        currentItemRef = item
+        let gen = generation
+        lock.unlock()
+
+        // 播完 EOF：置位后 status() 自报 idle（等价 mpv eof-reached → idle）。
+        // generation 注册时快照 + item 身份双校验：旧 item 的迟到回调一律忽略。
         let observer = NotificationCenter.default.addObserver(
             forName: NSNotification.Name.AVPlayerItemDidPlayToEndTime,
             object: item, queue: nil
         ) { [weak self] _ in
-            self?.lock.lock()
-            self?.eofReached = true
-            self?.lock.unlock()
+            self?.handleItemEnded(item, generation: gen)
         }
         // item 加载失败（源不可达/解码失败）：清空媒体 → status() 自报 idle，
         // 等价 mpv loadfile 失败后回到 idle（Server 经 /status 如实迁移）。
+        // 仅当"失败的 item 仍是当前 item"才清空——旧 item 的迟到失败不得误清新会话。
         let statusObs = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-            guard item.status == .failed else { return }
-            self?.lock.lock()
-            self?.itemFailed = true
-            self?.lock.unlock()
-            self?.player.replaceCurrentItem(with: nil)
+            self?.handleItemStatus(item, generation: gen)
         }
 
         lock.lock()
@@ -91,12 +102,11 @@ final class PlaybackController: PlaybackControlling {
         Task { [weak self] in
             if let duration = try? await asset.load(.duration).seconds, duration.isFinite {
                 let ms = Self.secToMS(duration)
-                self?.storeDuration(ms)
+                self?.storeDuration(ms, generation: gen)
             }
         }
 
         player.replaceCurrentItem(with: item)
-        player.isMuted = true // 渲染端只管视频画面/进度，音频交给系统输出设备（避免独占 audio session）
         if positionMS > 0 {
             // 续播位置折叠进 load：seek 先于 play 下发，AVPlayer 会在 item
             // 就绪后从该位置起播（等价 loadfile start=+<sec>）。
@@ -106,22 +116,70 @@ final class PlaybackController: PlaybackControlling {
         return nil
     }
 
+    /// 播完通知入口（generation 为注册时快照；internal 供测试直注旧回调）：
+    /// 仅当回调属于当前会话（generation 未过期且 item 仍是 current）才置 EOF。
+    func handleItemEnded(_ item: AVPlayerItem, generation gen: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard gen == generation, currentItemRef === item else { return } // 旧 item 迟到回调
+        eofReached = true
+    }
+
+    /// item 状态变化入口（generation 为注册时快照；internal 供测试直注旧回调）：
+    /// 仅当前 item 的失败才清空媒体；旧 item 的迟到失败一律忽略。
+    func handleItemStatus(_ item: AVPlayerItem, generation gen: Int) {
+        guard item.status == .failed else { return }
+        lock.lock()
+        let stale = (gen != generation) || (currentItemRef !== item)
+        lock.unlock()
+        guard !stale else { return }
+        lock.lock()
+        itemFailed = true
+        lock.unlock()
+        player.replaceCurrentItem(with: nil)
+    }
+
     func pause() -> String? {
         player.pause() // 幂等，与 mpv set pause yes 语义等价
         return nil
     }
 
     func stop() -> String? {
+        // 先摘除旧 item 的观察者（block 通知 token 须显式 removeObserver，
+        // KVO 须 invalidate——否则旧 item 的迟到回调永久存活）并 bump generation
+        // 使任何在途回调失效，再清空媒体。
+        detachObservers()
         lock.lock()
+        generation += 1
         eofReached = false
         itemFailed = false
         durationMS = 0
         mediaTitle = ""
-        endObserver = nil
-        statusObservation = nil
+        currentItemRef = nil
         lock.unlock()
         player.replaceCurrentItem(with: nil) // 回到无媒体（等价 mpv stop → idle）
         return nil
+    }
+
+    /// 摘除当前 item 的观察者（自行加锁；幂等）。
+    private func detachObservers() {
+        lock.lock()
+        let end = endObserver
+        let status = statusObservation
+        endObserver = nil
+        statusObservation = nil
+        lock.unlock()
+        if let end = end {
+            NotificationCenter.default.removeObserver(end)
+        }
+        status?.invalidate()
+    }
+
+    deinit {
+        if let end = endObserver {
+            NotificationCenter.default.removeObserver(end)
+        }
+        statusObservation?.invalidate()
     }
 
     func seekTo(ms: Int64) -> String? {
@@ -163,10 +221,13 @@ final class PlaybackController: PlaybackControlling {
         )
     }
 
-    /// 时长落库（同步方法内加锁，避免在异步上下文直接 lock/unlock）。
-    private func storeDuration(_ ms: Int64) {
+    /// 时长落库（同步方法内加锁，避免在异步上下文直接 lock/unlock）；
+    /// generation 已过期（旧 asset 的迟到加载）则丢弃。
+    private func storeDuration(_ ms: Int64, generation gen: Int) {
         lock.lock()
-        durationMS = ms
+        if gen == generation {
+            durationMS = ms
+        }
         lock.unlock()
     }
 
