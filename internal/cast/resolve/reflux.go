@@ -3,6 +3,7 @@ package resolve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -77,11 +78,11 @@ func (r *RefluxSource) Search(ctx context.Context, q string) ([]Item, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, fmt.Errorf("reflux search: %w", err)
+		return nil, fmt.Errorf("reflux search: %w", redactTransportErr(err))
 	}
 	resp, err := r.client().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("reflux search: %w", err)
+		return nil, fmt.Errorf("reflux search: %w", redactTransportErr(err))
 	}
 	defer resp.Body.Close()
 	if err := checkRefluxStatus(resp, "reflux search"); err != nil {
@@ -125,12 +126,12 @@ func (r *RefluxSource) StreamURL(ctx context.Context, id string) (string, error)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("reflux stream %s: %w", id, err)
+		return "", fmt.Errorf("reflux stream %s: %w", id, redactTransportErr(err))
 	}
 	req.Header.Set("Range", "bytes=0-0")
 	resp, err := r.client().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("reflux stream %s: %w", id, err)
+		return "", fmt.Errorf("reflux stream %s: %w", id, redactTransportErr(err))
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1)) // 探测：不消费完整流
@@ -152,12 +153,37 @@ func checkRefluxStatus(resp *http.Response, prefix string) error {
 	return fmt.Errorf("%s: status %d", prefix, resp.StatusCode)
 }
 
-// client 兜底 HC（零值 RefluxSource 仍可用）。
+// redactTransportErr 把传输层错误改写成不含凭证的等价错误。*url.Error 的文本
+// 内嵌完整请求 URL（含 api_key=<token>），而这段文本会一路进审计 JSONL、
+// slog.Warn 与 LLM 转录——reflux 不可达是常态故障，凭证明文落盘即泄露。
+// 改写为 "<op> <scheme://host/path（去查询串/用户信息/片段）>: <底层原因>"，
+// 底层原因仍以 %w 包裹保留（errors.Is/As 对连接错误的判定不受影响）。
+func redactTransportErr(err error) error {
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	safeURL := ue.URL
+	if parsed, perr := url.Parse(ue.URL); perr == nil {
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		parsed.User = nil
+		safeURL = parsed.String()
+	}
+	return fmt.Errorf("%s %s: %w", ue.Op, safeURL, ue.Err)
+}
+
+// defaultHTTPClient 是零值 RefluxSource 兜底的 HTTP 客户端：带超时——
+// http.DefaultClient 无超时，实例半开（接受 TCP 却不响应）会把检索/拉流
+// 永久挂起。
+var defaultHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+// client 兜底 HC（零值 RefluxSource 仍可用，且必带超时）。
 func (r *RefluxSource) client() *http.Client {
 	if r.HC != nil {
 		return r.HC
 	}
-	return http.DefaultClient
+	return defaultHTTPClient
 }
 
 // kindFromJellyfin 把 Jellyfin 条目类别映射成 resolve 的 video/audio/image；
