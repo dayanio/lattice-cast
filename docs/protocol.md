@@ -189,6 +189,7 @@ token 缺失或不符时返回 `401`：
 - `idle →(play)→ playing`：`/play` 开始播放新媒体；
 - `playing ⇄ paused`：`/pause` 暂停；再次 `/play`（携原 `url`，可带 `position_ms`）恢复；
 - `(playing|paused) →(stop)→ idle`：`/stop` 停止并清空媒体；
+- **`playing →(播放到结尾)→ idle`（进度与标题清零）**：媒体自然播放到结尾（EOF）时渲染端自行回到 `idle`，无需 `/stop`；此后的 `GET /status` 如实上报 `idle`，不得谎报 `playing`。
 - **`error` 仅由 `/play` 失败进入**（解码失败 / URL 不可达，从任意状态均可）；离开 `error` 只有一种方式——**下一次 `/play`**：成功则 `playing`，再次失败则停留 `error`。`/pause` `/stop` `/seek` `/volume` 均不改变 `error` 态。
 
 ## 七、契约夹具
