@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"os"
@@ -20,10 +21,12 @@ import (
 )
 
 // ipcDialTimeout 单次 unix socket 连接超时；ipcBootTimeout 等待 mpv 创建
-// IPC socket 的上限（mpv 启动即建 socket，通常毫秒级）。
+// IPC socket 的上限（mpv 启动即建 socket，通常毫秒级）；closeReapTimeout
+// 是 Close 等待 reaper（cmd.Wait）收尸的上限兜底。
 const (
-	ipcDialTimeout = 2 * time.Second
-	ipcBootTimeout = 5 * time.Second
+	ipcDialTimeout   = 2 * time.Second
+	ipcBootTimeout   = 5 * time.Second
+	closeReapTimeout = 2 * time.Second
 )
 
 // MpvController 是 Controller 的 mpv 生产实现：整个进程生命周期内拉起一个
@@ -35,8 +38,11 @@ const (
 type MpvController struct {
 	sockPath string // mpv --input-ipc-server 的 unix socket 路径
 
-	tmpDir string    // socket 所在临时目录（进程归我们管时非空，Close 时清理）
-	cmd    *exec.Cmd // 常驻 mpv 进程（测试直连 socket 时为 nil）
+	tmpDir   string    // socket 所在临时目录（进程归我们管时非空，Close 时清理）
+	cmd      *exec.Cmd // 常驻 mpv 进程（测试直连 socket 时为 nil）
+	reapDone chan struct{}
+	// reaper（独占 cmd.Wait）完成信号：Close 只 kill 不 Wait，据它同步收尾
+	// （带超时兜底）；nil 表示无进程可等（测试直连 / 已 Close），保证幂等。
 
 	mu   sync.Mutex
 	conn net.Conn      // IPC 连接（懒建立，断线重连）
@@ -72,6 +78,16 @@ func NewMpvController(mpvBin string) (*MpvController, error) {
 		_ = os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("start mpv %s: %w", path, err)
 	}
+	// reaper 独占 cmd.Wait（exec.Cmd 的 Wait 不允许并发调用）：mpv 死亡时
+	// 记日志收尸，避免僵尸进程；Close 经 reapDone 与之同步，不二次 Wait。
+	cmd := m.cmd
+	done := make(chan struct{})
+	m.reapDone = done
+	go func() {
+		defer close(done)
+		err := cmd.Wait()
+		slog.Warn("mpv exited", "err", err) // kill 停机时为 signal: killed，属预期
+	}()
 	if err := m.waitSocket(ipcBootTimeout); err != nil {
 		_ = m.Close()
 		return nil, err
@@ -84,19 +100,27 @@ func newIpcController(sockPath string) *MpvController {
 	return &MpvController{sockPath: sockPath}
 }
 
-// Close 停掉 mpv 进程并清理临时目录（幂等）。
+// Close 断开 IPC、杀掉 mpv 进程并清理临时目录（幂等：重复 Close 时进程
+// 字段已清空，直接落到目录清理收尾）。Wait 由 reaper 独占——这里只 kill，
+// 再等 reaper 收尸（超时兜底则放弃等待，进程由 reaper 迟缓收尾）。
 func (m *MpvController) Close() error {
 	m.mu.Lock()
 	m.disconnectLocked()
 	cmd := m.cmd
-	m.cmd = nil
+	done := m.reapDone
+	m.cmd, m.reapDone = nil, nil
 	dir := m.tmpDir
 	m.tmpDir = ""
 	m.mu.Unlock()
 
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(closeReapTimeout):
+		}
 	}
 	if dir != "" {
 		return os.RemoveAll(dir)
@@ -173,27 +197,67 @@ func (m *MpvController) Volume(level int) error {
 // Status 从 mpv 属性映射协议状态：idle-active 或 eof-reached → idle（全零）；
 // pause → paused；有媒体且未暂停 → playing；time-pos/duration 为浮点秒，
 // 四舍五入为毫秒。属性读取失败按零值处理（mpv 无该属性 / 连接刚断）。
+// IPC 连接级故障（mpv 已死 / socket 不可达）不再吞成零值 playing——那会让
+// agent 看到一个永远 playing 的僵尸——而是告警并按 idle 上报（对协议层等价
+// 于"无媒体可播"）。告警每次轮询触发一次，未做限频（v1 /status 轮询频率
+// 低，可接受；mpv 被杀后 mpv exited 由 reaper 记录根因）。
 func (m *MpvController) Status() adapter.Status {
-	idleActive, _ := m.getBool("idle-active")
-	eof, _ := m.getBool("eof-reached")
-	if idleActive || eof {
+	var connErr error // 首个 IPC 连接级错误（非 nil = mpv 不可达）
+	pick := func(err error) {
+		if connErr == nil && isConnErr(err) {
+			connErr = err
+		}
+	}
+	boolProp := func(name string) bool {
+		v, err := m.getBool(name)
+		pick(err)
+		return err == nil && v
+	}
+	floatProp := func(name string) (float64, bool) {
+		v, err := m.getFloat(name)
+		pick(err)
+		return v, err == nil
+	}
+	strProp := func(name string) (string, bool) {
+		v, err := m.getString(name)
+		pick(err)
+		return v, err == nil
+	}
+
+	if boolProp("idle-active") || boolProp("eof-reached") {
 		return adapter.Status{State: stateIdle}
 	}
 
 	st := adapter.Status{State: statePlaying}
-	if paused, _ := m.getBool("pause"); paused {
+	if boolProp("pause") {
 		st.State = statePaused
 	}
-	if v, err := m.getFloat("time-pos"); err == nil {
+	if v, ok := floatProp("time-pos"); ok {
 		st.PositionMS = secToMS(v)
 	}
-	if v, err := m.getFloat("duration"); err == nil {
+	if v, ok := floatProp("duration"); ok {
 		st.DurationMS = secToMS(v)
 	}
-	if v, err := m.getString("media-title"); err == nil {
+	if v, ok := strProp("media-title"); ok {
 		st.Title = v
 	}
+
+	if connErr != nil {
+		slog.Warn("mpv ipc unreachable; reporting idle", "err", connErr)
+		return adapter.Status{State: stateIdle}
+	}
 	return st
+}
+
+// isConnErr 判定 err 是否为 IPC 传输层故障（dial/读写失败），与 mpv 命令级
+// 错误（如 "property unavailable"，errors.New 纯文本）区分：command() 的
+// 传输错误均包裹底层 net/io 错误，据此识别。
+func isConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	return errors.As(err, &ne) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // ---- JSON IPC 传输 ----

@@ -312,6 +312,21 @@ func TestIpcStatus_SecondRoundingToMs(t *testing.T) {
 	assert.Equal(t, int64(500), st.DurationMS)
 }
 
+func TestIpcStatus_DeadIPC_ReportsIdle(t *testing.T) {
+	f := newFakeMpv(t)
+	f.setProp("idle-active", false)
+	f.setProp("eof-reached", false)
+	f.setProp("pause", false)
+	f.setProp("time-pos", 30.0)
+	ctl := newTestController(t, f)
+
+	// 模拟 mpv 死亡：IPC socket 不再 accept（dial 失败）。此前会被吞成
+	// 零值 playing（僵尸假活），现应告警并上报 idle。
+	require.NoError(t, f.ln.Close())
+
+	assert.Equal(t, adapter.Status{State: "idle"}, ctl.Status())
+}
+
 func TestNewMpvController_MissingBinary_ActionableError(t *testing.T) {
 	_, err := NewMpvController("/no/such/mpv-binary")
 	require.Error(t, err)
@@ -348,4 +363,8 @@ func TestMpvIntegration_Smoke(t *testing.T) {
 
 	require.NoError(t, ctl.Volume(50))
 	require.NoError(t, ctl.Stop())
+
+	// Close 幂等：reaper 独占 cmd.Wait，重复 Close 不二次 Wait、不报错
+	require.NoError(t, ctl.Close())
+	require.NoError(t, ctl.Close())
 }
