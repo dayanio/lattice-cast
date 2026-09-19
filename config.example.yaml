@@ -9,6 +9,7 @@ media_http_listen: "0.0.0.0:7810"
 
 # 渲染端访问媒体服务的基址：必填，须填本机内网 IP（渲染端在别的设备上，
 # 不能写 127.0.0.1）。审计日志固定写在进程工作目录 lattice-cast.audit.jsonl。
+# 注意：媒体 HTTP 服务无鉴权，任何局域网设备可按 media_id 拉取媒体文件——仅限家庭可信内网（v2 计划加共享 Token）
 media_base_url: http://192.168.1.10:7810
 
 # NAS 媒体目录列表：递归扫描 mp4/mkv/mov/mp3/flac/wav/m4a/jpg/png。
