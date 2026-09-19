@@ -27,7 +27,9 @@ import (
 )
 
 // Device 是一台设备对外的清单视图（MCP list_devices 的元素）。
-// 离线时 Online=false 且 State/NowPlaying 为空（omitempty 不出现在 JSON 里）。
+// 离线时 Online=false 且 State/NowPlaying 为空（omitempty 不出现在 JSON 里）；
+// Online=true 且 State="error" 表示渲染端应答了但报错（如 token 不符）——
+// 设备活着，问题多半在配置，不得误报成离线。
 type Device struct {
 	Name       string `json:"name"`
 	Room       string `json:"room"`
@@ -87,9 +89,11 @@ func (m *Manager) Refresh(ctx context.Context) {
 	}
 }
 
-// List 刷新注册表后逐台探测状态：在线设备回填 state/now_playing，
-// 离线（或尚未寻址）设备 Online=false 且两字段为空。清单按设备名排序，
-// 覆盖配置中全部设备（离线设备不得从清单消失）。探测失败不视为整体失败。
+// List 刷新注册表后逐台探测状态：在线设备回填 state/now_playing；网络不可达
+// （或尚未寻址）的设备 Online=false 且两字段为空；渲染端应答了但报错（如
+// token 不符的 401、ok=false）的设备仍在线，标记 State="error"——设备活着，
+// 异常须如实呈现而非误报离线。清单按设备名排序，覆盖配置中全部设备（离线
+// 设备不得从清单消失）。探测失败不视为整体失败。
 func (m *Manager) List(ctx context.Context) ([]Device, error) {
 	m.Refresh(ctx)
 
@@ -113,7 +117,13 @@ func (m *Manager) List(ctx context.Context) ([]Device, error) {
 			device.Online = true
 			device.State = st.State
 			device.NowPlaying = st.Title
+		} else if !netUnreachable(err) {
+			// 渲染端应答了但报错（如 token 不符的 401、ok=false）：
+			// 在线但异常 → State="error"，供 LLM 甄别配置问题。
+			device.Online = true
+			device.State = "error"
 		}
+		// 网络不可达（*url.Error）：保持 Online=false 且两字段为空。
 		devices = append(devices, device)
 	}
 	return devices, nil
@@ -187,12 +197,18 @@ func (m *Manager) target(name string) (adapter.Target, error) {
 	return adapter.Target{Host: d.Host, Port: d.Port, Token: d.Token}, nil
 }
 
+// netUnreachable 判定是否网络类失败（*url.Error）：List 逐台探测与各操作
+// 共用同一判据——网络不可达即离线；渲染端应答的应用层错误（如
+// *latticecast.ProtocolError 的 unauthorized/not_found）不算。
+func netUnreachable(err error) bool {
+	var ue *url.Error
+	return errors.As(err, &ue)
+}
+
 // offline 把网络类失败包上 device_offline 前缀供 MCP 层甄别；应用层错误
 // （*latticecast.ProtocolError，如 unauthorized/not_found）原样上抛。
-// 判据与协议客户端契约一致：网络失败即 *url.Error。
 func offline(err error) error {
-	var ue *url.Error
-	if errors.As(err, &ue) {
+	if netUnreachable(err) {
 		return fmt.Errorf("device_offline: %w", err)
 	}
 	return err
