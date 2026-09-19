@@ -20,6 +20,14 @@ media_library:
 # yt-dlp 可执行文件路径；留空 = 禁用 YouTube 播放（播 YouTube 会报 youtube_disabled）。
 yt_dlp: /usr/local/bin/yt-dlp
 
+# reflux 内容源（可选）：指向你的 reflux 实例基址（Jellyfin 兼容 API，索引
+# 115 网盘等）。配置后 search_media 会同时检索 reflux 媒体库（reflux 条目的
+# media_id 带 reflux: 前缀），cast_play 直接把 reflux 的 static 直链下发给
+# 渲染端（渲染端与 reflux 须在同一内网可达）。留空 = 禁用 reflux 内容源；
+# 填写后下一行 reflux_token 必填（reflux 的所有端点都要求 api_key）。
+# reflux_url: http://192.168.1.20:8096
+# reflux_token: change-me-to-your-reflux-api-key
+
 # MCP Bearer token（v1 为静态 token）：必填，LLM 客户端请求须带
 # Authorization: Bearer <token>；请换成足够长的随机串。
 auth_token: change-me-to-a-long-random-token

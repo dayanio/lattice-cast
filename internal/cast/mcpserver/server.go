@@ -97,7 +97,7 @@ func New(mgr *manager.Manager, lib *resolve.Library, res *resolve.Resolver, audi
 		&mcp.Tool{Name: "list_cast_devices", Description: "List cast devices with online state and what is playing."},
 		s.listDevices)
 	mcp.AddTool[searchIn, []resolve.Item](srv,
-		&mcp.Tool{Name: "search_media", Description: "Search the NAS media library by title substring; returns media_id for cast_play."},
+		&mcp.Tool{Name: "search_media", Description: "Search media by title substring: NAS library plus configured reflux server; returns media_id for cast_play (reflux ids carry a reflux: prefix)."},
 		s.searchMedia)
 	mcp.AddTool[playIn, playOut](srv,
 		&mcp.Tool{Name: "cast_play", Description: "Play media on a device by media_id (library) or url (direct/YouTube page); pass exactly one."},
@@ -166,7 +166,7 @@ func (s *Server) listDevices(ctx context.Context, _ *mcp.CallToolRequest, _ list
 
 func (s *Server) searchMedia(ctx context.Context, _ *mcp.CallToolRequest, in searchIn) (*mcp.CallToolResult, []resolve.Item, error) {
 	start := time.Now()
-	items := s.lib.Search(in.Query) // 检索不失败：无命中即空数组
+	items := s.res.Search(ctx, in.Query) // NAS ∪ reflux；reflux 失败已在 Resolver 内降级为 Warn + 仅 NAS，检索不失败
 	s.record(ctx, "search_media", in, items, nil, start)
 	return nil, items, nil
 }

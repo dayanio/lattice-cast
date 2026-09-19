@@ -29,15 +29,17 @@ import (
 	"github.com/dayanio/lattice-cast/internal/cast/manager"
 	"github.com/dayanio/lattice-cast/internal/cast/mcpserver"
 	"github.com/dayanio/lattice-cast/internal/cast/resolve"
+	"github.com/dayanio/lattice-cast/internal/cast/testsupport/fakereflux"
 	"github.com/dayanio/lattice-cast/internal/cast/testsupport/fakerenderer"
 )
 
 // 测试常量：MCP token 与渲染端 token 各司其职（后者由 Fake 校验）。
 const (
-	mcpToken  = "testtoken"
-	renderTok = "tok"
-	devName   = "bedroom-tv"
-	devRoom   = "卧室"
+	mcpToken    = "testtoken"
+	renderTok   = "tok"
+	refluxToken = "tok-reflux"
+	devName     = "bedroom-tv"
+	devRoom     = "卧室"
 
 	// callTimeout 单次 tools/call 的上限：list_cast_devices 内部有一次
 	// discovery.Browse（组播窗口至多 3 秒，无组播环境降级为静态条目）。
@@ -59,6 +61,8 @@ type stack struct {
 	mcpURL    string // MCP 端点 http://127.0.0.1:<port>
 	mediaURL  string // 媒体服务基址（= cfg.MediaBaseURL）
 	auditPath string
+	fake      *fakerenderer.Fake // fake 渲染端（读回收到的拉流地址）
+	reflux    *fakereflux.Fake   // fake reflux 内容源（挂进 Resolver）
 }
 
 // startStack 复刻 main.go 的装配顺序（见 main.go run 的注释）：
@@ -116,7 +120,19 @@ func startStack(t *testing.T) *stack {
 	media := resolve.NewMediaServer(lib, cfg.MediaListen)
 	require.NoError(t, media.Start())
 
-	res := &resolve.Resolver{Lib: lib, Base: cfg.MediaBaseURL} // YtDlp 为空 → Ext=nil
+	// reflux 内容源：fake reflux 挂一部电影（配置了 reflux_url 即挂载，与
+	// main.go 的条件装配一致）。
+	refluxFake := fakereflux.New(refluxToken)
+	refluxFake.SetItems(map[string]any{
+		"Id":            "6334",
+		"Name":          "让子弹飞",
+		"OriginalTitle": "Let the Bullets Fly",
+		"Type":          "Movie",
+		"MediaType":     "Video",
+		"Year":          2010,
+	})
+	refluxSrc := resolve.NewRefluxSource(refluxFake.URL, refluxToken)
+	res := &resolve.Resolver{Lib: lib, Base: cfg.MediaBaseURL, Reflux: refluxSrc} // YtDlp 为空 → Ext=nil
 	mgr := manager.New(cfg, lib, res)
 	srv := mcpserver.New(mgr, lib, res, audit, mcpserver.StaticToken(cfg.AuthToken))
 
@@ -127,12 +143,15 @@ func startStack(t *testing.T) *stack {
 		mcpURL:    "http://" + mcpLn.Addr().String(),
 		mediaURL:  cfg.MediaBaseURL,
 		auditPath: auditPath,
+		fake:      fake,
+		reflux:    refluxFake,
 	}
 	t.Cleanup(func() {
 		_ = httpSrv.Close()
 		_ = media.Close()
 		_ = audit.Close()
 		fake.Close()
+		refluxFake.Close()
 	})
 	return s
 }
@@ -227,7 +246,26 @@ func TestEndToEnd(t *testing.T) {
 	call(t, cs, "cast_stop", map[string]any{"device": devName}, &st)
 	assert.Equal(t, "idle", st.Status.State)
 
-	// 审计：5 次工具调用各落一行，每行均为合法 JSON。
+	// 6. reflux 内容源：search_media 命中 fake reflux（media_id 带 reflux:
+	//    前缀），cast_play 据此前缀路由到 reflux 直链；渲染端收到的拉流地址
+	//    逐字为 reflux 的 static 直链，且 Resolver.ByID 探测过 reflux 可用性。
+	var refluxItems []resolve.Item
+	call(t, cs, "search_media", map[string]any{"query": "让子弹飞"}, &refluxItems)
+	require.Len(t, refluxItems, 1)
+	assert.Equal(t, "reflux:6334", refluxItems[0].ID)
+	assert.Equal(t, "让子弹飞", refluxItems[0].Title)
+
+	call(t, cs, "cast_play", map[string]any{
+		"device": devName, "media_id": "reflux:6334", "title": "让子弹飞",
+	}, &play)
+	assert.Equal(t, "playing", play.Status.State)
+	assert.Equal(t, s.reflux.URL+"/Videos/6334/stream?static=true&api_key="+refluxToken,
+		s.fake.PlayedURL(), "渲染端应收下 reflux 的 static 直链")
+	assert.GreaterOrEqual(t, s.reflux.StreamHits(), 1)
+	call(t, cs, "cast_stop", map[string]any{"device": devName}, &st)
+	assert.Equal(t, "idle", st.Status.State)
+
+	// 审计：8 次工具调用各落一行，每行均为合法 JSON。
 	b, err := os.ReadFile(s.auditPath)
 	require.NoError(t, err)
 	var lines []string
@@ -236,7 +274,7 @@ func TestEndToEnd(t *testing.T) {
 			lines = append(lines, line)
 		}
 	}
-	require.GreaterOrEqual(t, len(lines), 5, "5 次调用后审计应至少 5 行")
+	require.GreaterOrEqual(t, len(lines), 8, "8 次调用后审计应至少 8 行")
 	for i, line := range lines {
 		var e manager.AuditEntry
 		require.NoError(t, json.Unmarshal([]byte(line), &e), "审计第 %d 行应为合法 JSON", i+1)

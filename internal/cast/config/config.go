@@ -29,6 +29,11 @@ type Config struct {
 	YtDlp        string              `yaml:"yt_dlp"`     // 二进制路径；空=禁用 YouTube
 	AuthToken    string              `yaml:"auth_token"` // MCP Bearer（v1 静态）
 	Renderers    map[string]Renderer `yaml:"renderers"`  // key = mDNS 实例名 = 设备身份；必填非空
+
+	// reflux 内容源（可选，v1.1）：指向用户自建 reflux 实例的基址
+	//（Jellyfin 兼容 API，如 http://192.168.1.20:8096）；空 = 禁用。
+	RefluxURL   string `yaml:"reflux_url"`
+	RefluxToken string `yaml:"reflux_token"` // reflux api_key；reflux_url 非空时必填
 }
 
 // 监听地址默认值（字段缺省或为空字符串时应用）。
@@ -41,7 +46,9 @@ const (
 // 规则：
 //   - 文件缺失或不可读 → 错误（信息中包含 path）；
 //   - 未知字段 → 错误（yaml.Decoder.KnownFields(true)）；
-//   - 必填：auth_token 非空、media_base_url 非空、renderers 至少一个条目。
+//   - 必填：auth_token 非空、media_base_url 非空、renderers 至少一个条目；
+//   - 条件必填：reflux_url 非空时 reflux_token 必须非空（reflux 的 Jellyfin
+//     兼容 API 所有端点都要求 api_key，缺 token 等于不可用，宁启动报错）。
 func Load(path string) (Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -70,6 +77,8 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("config: %s: media_base_url is required", path)
 	case len(cfg.Renderers) == 0:
 		return Config{}, fmt.Errorf("config: %s: renderers must contain at least one entry", path)
+	case cfg.RefluxURL != "" && cfg.RefluxToken == "":
+		return Config{}, fmt.Errorf("config: %s: reflux_token is required when reflux_url is set", path)
 	}
 	return cfg, nil
 }

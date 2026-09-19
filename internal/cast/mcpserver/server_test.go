@@ -23,6 +23,7 @@ import (
 	"github.com/dayanio/lattice-cast/internal/cast/config"
 	"github.com/dayanio/lattice-cast/internal/cast/manager"
 	"github.com/dayanio/lattice-cast/internal/cast/resolve"
+	"github.com/dayanio/lattice-cast/internal/cast/testsupport/fakereflux"
 	"github.com/dayanio/lattice-cast/internal/cast/testsupport/fakerenderer"
 )
 
@@ -58,6 +59,13 @@ type fixture struct {
 // newStack 构造 Server 及其 httptest 外壳（不含客户端），返回外壳 URL。
 func newStack(t *testing.T) (url string, auditPath string, lib *resolve.Library, fake *fakerenderer.Fake) {
 	t.Helper()
+	return newStackWith(t, nil)
+}
+
+// newStackWith 同 newStack，但允许注入可选的 reflux 内容源（nil = 禁用，
+// 与真实部署"未配置 reflux_url"一致）。
+func newStackWith(t *testing.T, reflux *resolve.RefluxSource) (url string, auditPath string, lib *resolve.Library, fake *fakerenderer.Fake) {
+	t.Helper()
 
 	fake = fakerenderer.New(renderTok)
 	t.Cleanup(fake.Close)
@@ -76,7 +84,7 @@ func newStack(t *testing.T) (url string, auditPath string, lib *resolve.Library,
 	require.NoError(t, os.WriteFile(filepath.Join(libDir, "sunset-clip.mp4"), []byte("x"), 0o600))
 	lib = resolve.NewLibrary([]string{libDir})
 	require.NoError(t, lib.Rescan())
-	res := &resolve.Resolver{Lib: lib, Base: cfg.MediaBaseURL} // Ext=nil：YouTube 禁用
+	res := &resolve.Resolver{Lib: lib, Base: cfg.MediaBaseURL, Reflux: reflux} // Ext=nil：YouTube 禁用
 
 	auditPath = filepath.Join(t.TempDir(), "audit.jsonl")
 	audit, err := manager.OpenAudit(auditPath)
@@ -244,6 +252,61 @@ func TestSearchMedia(t *testing.T) {
 	assert.Empty(t, items)
 }
 
+// TestRefluxContentSource 接了 fake reflux 后：search_media 返回 NAS ∪ reflux
+// （reflux 条目带 reflux: 前缀）；cast_play 用 reflux media_id 时渲染端收到的
+// 是 reflux 的 static 直链。
+func TestRefluxContentSource(t *testing.T) {
+	const refluxTok = "tok-reflux-test"
+	rf := fakereflux.New(refluxTok)
+	rf.SetItems(map[string]any{
+		"Id":            "6334",
+		"Name":          "让子弹飞",
+		"OriginalTitle": "Let the Bullets Fly",
+		"Type":          "Movie",
+		"MediaType":     "Video",
+		"Year":          2010,
+	})
+	t.Cleanup(rf.Close)
+
+	url, auditPath, _, fake := newStackWith(t, resolve.NewRefluxSource(rf.URL, refluxTok))
+	f := &fixture{t: t, fake: fake, cs: connect(t, url), auditPath: auditPath}
+
+	// NAS 检索不回流（reflux 条目不含 "night"）。
+	var items []resolve.Item
+	f.callOK("search_media", map[string]any{"query": "night"}, &items)
+	require.Len(t, items, 1)
+	assert.NotContains(t, items[0].ID, "reflux:", "纯 NAS 命中不得带 reflux: 前缀")
+
+	// reflux 检索只回 reflux 条目，media_id 带 tagged 前缀。
+	f.callOK("search_media", map[string]any{"query": "让子弹飞"}, &items)
+	require.Len(t, items, 1)
+	assert.Equal(t, "reflux:6334", items[0].ID, "reflux 条目的 media_id 应带 tagged 前缀")
+	assert.Equal(t, "让子弹飞", items[0].Title)
+	assert.Equal(t, resolve.KindVideo, items[0].Kind)
+
+	// cast_play 走 reflux: id：渲染端收到的 URL 逐字为 reflux static 直链。
+	var out struct {
+		Status  adapter.Status `json:"status"`
+		Adapter string         `json:"adapter"`
+	}
+	f.callOK("cast_play", map[string]any{
+		"device": devName, "media_id": "reflux:6334", "title": "让子弹飞",
+	}, &out)
+	assert.Equal(t, "playing", out.Status.State)
+	assert.Equal(t, rf.URL+"/Videos/6334/stream?static=true&api_key="+refluxTok,
+		fake.PlayedURL(), "渲染端应收下 reflux 的 static 直链")
+	assert.GreaterOrEqual(t, rf.StreamHits(), 1, "Resolver.ByID 应对 reflux 做过可用性探测")
+
+	// 混合检索：NAS sunset-clip ∪ reflux 让子弹飞 并存（空查询全量合并）。
+	f.callOK("search_media", map[string]any{"query": ""}, &items)
+	ids := map[string]bool{}
+	for _, it := range items {
+		ids[it.ID] = true
+	}
+	assert.Len(t, items, 3, "NAS 2 条 + reflux 1 条")
+	assert.True(t, ids["reflux:6334"], "reflux 条目应在合并结果里")
+}
+
 // ---- cast_play：成功路径 ----
 
 // TestCastPlay_ByMediaID 走 Resolver.ByID（NAS 直链）播放成功：
@@ -331,6 +394,10 @@ func TestCastPlay_ResolveErrors(t *testing.T) {
 
 	got := f.callErr("cast_play", map[string]any{"device": devName, "media_id": "deadbeef0000"})
 	assert.Equal(t, "unknown_media_id: deadbeef0000", got)
+
+	// reflux: 前缀 id 但未配置 reflux → reflux_disabled（配置错误可转述）。
+	got = f.callErr("cast_play", map[string]any{"device": devName, "media_id": "reflux:6334"})
+	assert.Equal(t, "reflux_disabled", got)
 
 	got = f.callErr("cast_play", map[string]any{
 		"device": devName, "url": "https://www.youtube.com/watch?v=x",

@@ -5,6 +5,8 @@ media_library:
   - /media/music
   - /media/movies
 yt_dlp: /usr/local/bin/yt-dlp
+reflux_url: http://192.168.1.20:8096
+reflux_token: reflux-api-token
 auth_token: test-bearer-token
 renderers:
   # 静态寻址：host + port 显式给出。

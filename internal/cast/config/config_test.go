@@ -29,6 +29,8 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.Equal(t, "http://192.168.1.10:7810", cfg.MediaBaseURL)
 	assert.Equal(t, []string{"/media/music", "/media/movies"}, cfg.MediaLibrary)
 	assert.Equal(t, "/usr/local/bin/yt-dlp", cfg.YtDlp)
+	assert.Equal(t, "http://192.168.1.20:8096", cfg.RefluxURL)
+	assert.Equal(t, "reflux-api-token", cfg.RefluxToken)
 	assert.Equal(t, "test-bearer-token", cfg.AuthToken)
 
 	require.Len(t, cfg.Renderers, 2, "应解析出两个渲染端条目")
@@ -64,6 +66,55 @@ media_http_listen: "127.0.0.1:7820"
 	require.NoError(t, err)
 	assert.Equal(t, ":7900", cfg.MCPListen)
 	assert.Equal(t, "127.0.0.1:7820", cfg.MediaListen)
+	assert.Empty(t, cfg.RefluxURL, "未填 reflux_url = reflux 内容源禁用")
+}
+
+// TestLoad_RefluxTokenRequired 填了 reflux_url 但缺 reflux_token：必须报错
+// （reflux 的 Jellyfin 兼容 API 全部端点要求 api_key，无 token 等于不可用）。
+func TestLoad_RefluxTokenRequired(t *testing.T) {
+	path := writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+reflux_url: http://192.168.1.20:8096
+`)
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reflux_token")
+}
+
+// TestLoad_RefluxBothFields 流程正向：reflux_url + reflux_token 成对给出应
+// 原样解析（与 testdata/config.yaml 的断言互为补充，覆盖"临时配置"路径）。
+func TestLoad_RefluxBothFields(t *testing.T) {
+	path := writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+reflux_url: http://192.168.1.20:8096/
+reflux_token: another-reflux-token
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "http://192.168.1.20:8096/", cfg.RefluxURL)
+	assert.Equal(t, "another-reflux-token", cfg.RefluxToken)
+}
+
+// TestLoad_RefluxTokenWithoutURL 只给 reflux_token 不给 reflux_url：reflux
+// 保持禁用（token 无副作用），不报错。
+func TestLoad_RefluxTokenWithoutURL(t *testing.T) {
+	path := writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+reflux_token: orphan-token
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Empty(t, cfg.RefluxURL)
+	assert.Equal(t, "orphan-token", cfg.RefluxToken)
 }
 
 // TestLoad_MissingAuthToken 缺少 auth_token（必填）必须报错。

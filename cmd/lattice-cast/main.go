@@ -95,7 +95,13 @@ func run(configPath string) error {
 	if cfg.YtDlp != "" {
 		ext = resolve.NewYtDlp(cfg.YtDlp)
 	}
-	res := &resolve.Resolver{Lib: lib, Base: cfg.MediaBaseURL, Ext: ext}
+	// reflux 内容源（可选）：配置了 reflux_url 即挂载，search_media 同时检索
+	// reflux 媒体库、cast_play 支持 reflux: 前缀 media_id；未配置则保持禁用。
+	var reflux *resolve.RefluxSource
+	if cfg.RefluxURL != "" {
+		reflux = resolve.NewRefluxSource(cfg.RefluxURL, cfg.RefluxToken)
+	}
+	res := &resolve.Resolver{Lib: lib, Base: cfg.MediaBaseURL, Ext: ext, Reflux: reflux}
 
 	mgr := manager.New(cfg, lib, res)
 	srv := mcpserver.New(mgr, lib, res, audit, mcpserver.StaticToken(cfg.AuthToken))
