@@ -10,10 +10,23 @@ import (
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNewClient_DefaultTimeout(t *testing.T) {
+	// hc == nil：必须自带超时，避免渲染端接受 TCP 却不响应时永久挂起。
+	c := NewClient(nil)
+	require.NotNil(t, c.HTTP)
+	assert.Equal(t, 10*time.Second, c.HTTP.Timeout)
+
+	// 显式传入的 http.Client 原样使用，不改不包。
+	explicit := &http.Client{Timeout: 3 * time.Second}
+	c2 := NewClient(explicit)
+	assert.Same(t, explicit, c2.HTTP)
+}
 
 func hostOf(srv *httptest.Server) string {
 	u, err := url.Parse(srv.URL)

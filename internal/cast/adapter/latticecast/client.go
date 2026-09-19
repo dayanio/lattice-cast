@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/dayanio/lattice-cast/internal/cast/adapter"
 )
@@ -35,10 +36,11 @@ type Client struct {
 	HTTP *http.Client
 }
 
-// NewClient 构造协议客户端；hc 为 nil 时使用零值 http.Client（即 DefaultTransport）。
+// NewClient 构造协议客户端；hc 为 nil 时使用带 10s 超时的 http.Client
+//（否则对端接受 TCP 却不响应时，list/play 会永久挂起）。
 func NewClient(hc *http.Client) *Client {
 	if hc == nil {
-		hc = &http.Client{}
+		hc = &http.Client{Timeout: 10 * time.Second}
 	}
 	return &Client{HTTP: hc}
 }
