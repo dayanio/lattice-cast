@@ -198,7 +198,14 @@ func (s *Server) stop(ctx context.Context, _ *mcp.CallToolRequest, in deviceIn) 
 
 func (s *Server) volume(ctx context.Context, _ *mcp.CallToolRequest, in volumeIn) (*mcp.CallToolResult, statusOut, error) {
 	start := time.Now()
-	st, err := s.mgr.Volume(ctx, in.Device, in.Level) // 越界由 Manager 拒绝：level_out_of_range: <n>
+	if in.Level < 0 || in.Level > 100 {
+		// 契约错误文本为裸字符串（LLM 所见即 Content[0].Text）；
+		// Manager 的带前缀版本仅供 Go 直调方使用。
+		err := errors.New("level_out_of_range")
+		s.record(ctx, "cast_volume", in, statusOut{}, err, start)
+		return nil, statusOut{}, err
+	}
+	st, err := s.mgr.Volume(ctx, in.Device, in.Level)
 	out := statusOut{Status: st}
 	s.record(ctx, "cast_volume", in, out, err, start)
 	return nil, out, err
