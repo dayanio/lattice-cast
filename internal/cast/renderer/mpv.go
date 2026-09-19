@@ -53,6 +53,12 @@ type MpvController struct {
 // NewMpvController 校验 mpv 可用、拉起常驻 mpv 进程并等待 IPC socket 就绪。
 // mpv 不在 PATH 时返回带安装提示的错误（调用方应打印后退出）。
 func NewMpvController(mpvBin string) (*MpvController, error) {
+	return newMpvController(mpvBin, "--fullscreen")
+}
+
+// newMpvController 是构造主体；extraArgs 追加在常驻基础旗标之后（生产传
+// --fullscreen；真实进程测试传 --vo=null --ao=null 等保持无头不侵入）。
+func newMpvController(mpvBin string, extraArgs ...string) (*MpvController, error) {
 	path, err := exec.LookPath(mpvBin)
 	if err != nil {
 		return nil, errors.New("mpv not found: brew install mpv (macOS) / apt install mpv (Debian)")
@@ -65,12 +71,13 @@ func NewMpvController(mpvBin string) (*MpvController, error) {
 		sockPath: filepath.Join(tmpDir, "mpv-ipc.sock"),
 		tmpDir:   tmpDir,
 	}
-	m.cmd = exec.Command(path,
-		"--input-ipc-server="+m.sockPath,
+	args := []string{
+		"--input-ipc-server=" + m.sockPath,
 		"--idle=yes",      // 无媒体时驻留
 		"--keep-open=yes", // 播完不退出（eof 后回 idle 而非退出进程）
-		"--fullscreen",
-	)
+	}
+	args = append(args, extraArgs...)
+	m.cmd = exec.Command(path, args...)
 	// 静默 mpv 自身输出：测试要求 pristine output，排障靠 IPC 层报错。
 	m.cmd.Stdout = io.Discard
 	m.cmd.Stderr = io.Discard
@@ -130,20 +137,21 @@ func (m *MpvController) Close() error {
 
 // ---- Controller 接口 ----
 
-// Load 播放指定 URL：loadfile <url> replace；positionMS>0 时把续播位置折叠
-// 为 loadfile 的 start=+<sec> 选项（mpv 的 loadfile 异步生效，load 后立即
-// seek <sec> absolute 会在文件加载完成前被 mpv 拒绝——错误一旦被吞就表现为
-// 续播从 0 开始，故位置必须随 load 一起下发）；title 非空时补发
+// Load 播放指定 URL：loadfile <url> replace；positionMS>0 时把续播位置折叠为
+// loadfile 选项串的 start=+<sec>（12500 → "start=+12.5"，-1 精度去掉尾零，
+// 整秒输出 "start=+30"）。注意 loadfile 的第 4 个位置参数是插入 index 而非
+// 选项（本机 mpv 0.41 实测 4-arg "start=..." 回 invalid parameter），选项须
+// 作第 5 参数，index 用 -1 追加到播放列表末尾。mpv 的 loadfile 异步生效，
+// load 后立即 seek <sec> absolute 会在文件加载完成前被 mpv 拒绝——错误一旦
+// 被吞就表现为续播从 0 开始，故位置必须随 load 一起下发；title 非空时补发
 // set force-media-title <title>。mpv 的 media-title 属性本身只读
 // （实测 0.41 报 error running command），force-media-title 是官方的
 // 展示标题覆写位，media-title 随之生效。
 func (m *MpvController) Load(_ context.Context, url, title string, positionMS int64) error {
 	args := []any{"loadfile", url, "replace"}
 	if positionMS > 0 {
-		// start 选项按字符串解析：毫秒 → 秒（12500 → "start=+12.5"，
-		// -1 精度去掉尾零，整秒输出 "start=+30"）。
 		sec := strconv.FormatFloat(float64(positionMS)/1000.0, 'f', -1, 64)
-		args = append(args, "start=+"+sec)
+		args = append(args, "-1", "start=+"+sec)
 	}
 	if _, err := m.command(args...); err != nil {
 		return err

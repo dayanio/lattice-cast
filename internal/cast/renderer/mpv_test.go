@@ -2,8 +2,11 @@ package renderer
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -158,13 +161,16 @@ func TestIpcLoad_ResumePosition_FoldsIntoStartOption(t *testing.T) {
 	f := newFakeMpv(t)
 	ctl := newTestController(t, f)
 
-	// 12500ms → 恰好 4 元素：["loadfile", url, "replace", "start=+12.5"]
-	//（mpv 的 loadfile 异步生效，续播位置必须折进 load，不能 load 后补 seek）
+	// 12500ms → 恰好 5 元素：["loadfile", url, "replace", "-1", "start=+12.5"]
+	//（mpv ≥0.38 的 loadfile 第 4 个位置参数是插入 index 而非选项——本机
+	// 0.41 实测 4-arg "start=..." 直接报 invalid parameter——选项须作第 5
+	// 参数，index 用 -1 追加；loadfile 异步生效，续播位置必须折进 load，
+	// 不能 load 后补 seek）
 	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "星际穿越", 12500))
 
 	cmds := f.commands()
 	require.Len(t, cmds, 2, "start 折进 loadfile，不应另发 seek")
-	assert.Equal(t, []any{"loadfile", "http://x/a.mp4", "replace", "start=+12.5"}, cmds[0])
+	assert.Equal(t, []any{"loadfile", "http://x/a.mp4", "replace", "-1", "start=+12.5"}, cmds[0])
 	assert.Equal(t, []any{"set", "force-media-title", "星际穿越"}, cmds[1])
 }
 
@@ -175,7 +181,7 @@ func TestIpcLoad_ResumePosition_SubSecondMs(t *testing.T) {
 	// 非整百毫秒：-1 精度浮点格式化保留全部毫秒位（90250 → "start=+90.25"）
 	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "", 90250))
 
-	assert.Equal(t, [][]any{{"loadfile", "http://x/a.mp4", "replace", "start=+90.25"}}, f.commands())
+	assert.Equal(t, [][]any{{"loadfile", "http://x/a.mp4", "replace", "-1", "start=+90.25"}}, f.commands())
 }
 
 func TestIpcPause_FromPlaying_SetsPauseTrue(t *testing.T) {
@@ -367,4 +373,68 @@ func TestMpvIntegration_Smoke(t *testing.T) {
 	// Close 幂等：reaper 独占 cmd.Wait，重复 Close 不二次 Wait、不报错
 	require.NoError(t, ctl.Close())
 	require.NoError(t, ctl.Close())
+}
+
+// writeSineWAV 生成 seconds 秒 8kHz/16bit/单声道 440Hz 正弦波 WAV（测试自产
+// 可播媒体：零外部依赖、零网络、时长精确），返回绝对路径供真实 mpv 播放。
+func writeSineWAV(t *testing.T, seconds int) string {
+	t.Helper()
+	const sampleRate = 8000
+	total := sampleRate * seconds
+	pcm := make([]byte, 0, total*2)
+	for i := 0; i < total; i++ {
+		v := int16(20000 * math.Sin(2*math.Pi*440*float64(i)/sampleRate))
+		pcm = append(pcm, byte(v), byte(v>>8))
+	}
+	var buf bytes.Buffer
+	buf.WriteString("RIFF")
+	binary.Write(&buf, binary.LittleEndian, uint32(36+len(pcm)))
+	buf.WriteString("WAVEfmt ")
+	binary.Write(&buf, binary.LittleEndian, uint32(16))           // fmt 块长度
+	binary.Write(&buf, binary.LittleEndian, uint16(1))            // PCM
+	binary.Write(&buf, binary.LittleEndian, uint16(1))            // 单声道
+	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))   // 采样率
+	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*2)) // byte rate
+	binary.Write(&buf, binary.LittleEndian, uint16(2))            // block align
+	binary.Write(&buf, binary.LittleEndian, uint16(16))           // 位深
+	buf.WriteString("data")
+	binary.Write(&buf, binary.LittleEndian, uint32(len(pcm)))
+	buf.Write(pcm)
+
+	path := filepath.Join(t.TempDir(), "sine.wav")
+	require.NoError(t, os.WriteFile(path, buf.Bytes(), 0o600))
+	return path
+}
+
+// TestMpvIntegration_ResumePosition 是真实 mpv 的续播回归——IPC fake 只记录
+// 参数帧，发不出 fake 与现实 mpv 的行为漂移：本机 0.41 实测 loadfile 第 4 个
+// 位置参数是插入 index，4-arg 的 "start=..." 选项直接报 invalid parameter，
+// 只有真进程能守住（选项须作第 5 参数，index 用 -1）。无头启动
+// （--vo=null --ao=null）保持测试不侵入桌面；断言位置落在 start(30s)+~1s。
+func TestMpvIntegration_ResumePosition(t *testing.T) {
+	if _, err := exec.LookPath("mpv"); err != nil {
+		t.Skip("mpv 未安装，跳过真实进程集成测试")
+	}
+
+	media := writeSineWAV(t, 60)
+	ctl, err := newMpvController("mpv", "--vo=null", "--ao=null")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ctl.Close() })
+
+	// 4-arg 旧形态下 mpv 对该 loadfile 回 invalid parameter → 此处 NoError 即 RED
+	require.NoError(t, ctl.Load(context.Background(), media, "正弦波", 30000))
+
+	// loadfile 异步生效：3s 内 time-pos 应从 start≈30s 起播并推进。
+	deadline := time.Now().Add(3 * time.Second)
+	var last adapter.Status
+	for {
+		last = ctl.Status()
+		if last.PositionMS >= 25000 && last.PositionMS <= 40000 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("续播位置应落在 [25000,40000]ms，3s 内始终为 %+v", last)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
