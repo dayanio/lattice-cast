@@ -64,6 +64,14 @@ func (f *Fake) Target() adapter.Target {
 	return adapter.Target{Host: addr.IP.String(), Port: addr.Port, Token: f.token}
 }
 
+// PlayedURL 返回当前/最近一次播放的媒体 URL（未播放过为空串）：供测试断言
+// "渲染端收到的拉流地址"（如 reflux 直链）。
+func (f *Fake) PlayedURL() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.url
+}
+
 // SetPlaying 预置播放态（测试用）：直接进入 playing 并带上标题与时长；
 // 位置保持原值（缺省 0），供测试跳过播放前置步骤。
 func (f *Fake) SetPlaying(url, title string, durationMS int64) {
