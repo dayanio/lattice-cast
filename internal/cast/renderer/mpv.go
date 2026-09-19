@@ -106,12 +106,22 @@ func (m *MpvController) Close() error {
 
 // ---- Controller 接口 ----
 
-// Load 播放指定 URL：loadfile <url> replace；title 非空时补发
+// Load 播放指定 URL：loadfile <url> replace；positionMS>0 时把续播位置折叠
+// 为 loadfile 的 start=+<sec> 选项（mpv 的 loadfile 异步生效，load 后立即
+// seek <sec> absolute 会在文件加载完成前被 mpv 拒绝——错误一旦被吞就表现为
+// 续播从 0 开始，故位置必须随 load 一起下发）；title 非空时补发
 // set force-media-title <title>。mpv 的 media-title 属性本身只读
 // （实测 0.41 报 error running command），force-media-title 是官方的
 // 展示标题覆写位，media-title 随之生效。
-func (m *MpvController) Load(_ context.Context, url, title string) error {
-	if _, err := m.command("loadfile", url, "replace"); err != nil {
+func (m *MpvController) Load(_ context.Context, url, title string, positionMS int64) error {
+	args := []any{"loadfile", url, "replace"}
+	if positionMS > 0 {
+		// start 选项按字符串解析：毫秒 → 秒（12500 → "start=+12.5"，
+		// -1 精度去掉尾零，整秒输出 "start=+30"）。
+		sec := strconv.FormatFloat(float64(positionMS)/1000.0, 'f', -1, 64)
+		args = append(args, "start=+"+sec)
+	}
+	if _, err := m.command(args...); err != nil {
 		return err
 	}
 	if title != "" {

@@ -136,22 +136,46 @@ func TestIpcLoad_SendsLoadfileThenTitle(t *testing.T) {
 	f := newFakeMpv(t)
 	ctl := newTestController(t, f)
 
-	require.NoError(t, ctl.Load(context.Background(), "http://192.168.1.10:7810/media/abc123", "星际穿越"))
+	require.NoError(t, ctl.Load(context.Background(), "http://192.168.1.10:7810/media/abc123", "星际穿越", 0))
 
 	cmds := f.commands()
-	assert.Contains(t, cmds, []any{"loadfile", "http://192.168.1.10:7810/media/abc123", "replace"})
-	assert.Contains(t, cmds, []any{"set", "force-media-title", "星际穿越"})
+	require.Len(t, cmds, 2)
+	assert.Equal(t, []any{"loadfile", "http://192.168.1.10:7810/media/abc123", "replace"}, cmds[0])
+	assert.Equal(t, []any{"set", "force-media-title", "星际穿越"}, cmds[1])
 }
 
 func TestIpcLoad_EmptyTitleSkipsTitleSet(t *testing.T) {
 	f := newFakeMpv(t)
 	ctl := newTestController(t, f)
 
-	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", ""))
+	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "", 0))
+
+	// 位置 0：plain 3 元素 loadfile，无 start 选项，无标题覆写
+	assert.Equal(t, [][]any{{"loadfile", "http://x/a.mp4", "replace"}}, f.commands())
+}
+
+func TestIpcLoad_ResumePosition_FoldsIntoStartOption(t *testing.T) {
+	f := newFakeMpv(t)
+	ctl := newTestController(t, f)
+
+	// 12500ms → 恰好 4 元素：["loadfile", url, "replace", "start=+12.5"]
+	//（mpv 的 loadfile 异步生效，续播位置必须折进 load，不能 load 后补 seek）
+	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "星际穿越", 12500))
 
 	cmds := f.commands()
-	assert.Contains(t, cmds, []any{"loadfile", "http://x/a.mp4", "replace"})
-	assert.Len(t, cmds, 1, "空标题只应下发 loadfile 一条命令")
+	require.Len(t, cmds, 2, "start 折进 loadfile，不应另发 seek")
+	assert.Equal(t, []any{"loadfile", "http://x/a.mp4", "replace", "start=+12.5"}, cmds[0])
+	assert.Equal(t, []any{"set", "force-media-title", "星际穿越"}, cmds[1])
+}
+
+func TestIpcLoad_ResumePosition_SubSecondMs(t *testing.T) {
+	f := newFakeMpv(t)
+	ctl := newTestController(t, f)
+
+	// 非整百毫秒：-1 精度浮点格式化保留全部毫秒位（90250 → "start=+90.25"）
+	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "", 90250))
+
+	assert.Equal(t, [][]any{{"loadfile", "http://x/a.mp4", "replace", "start=+90.25"}}, f.commands())
 }
 
 func TestIpcPause_FromPlaying_SetsPauseTrue(t *testing.T) {
