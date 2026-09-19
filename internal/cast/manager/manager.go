@@ -156,6 +156,32 @@ func (m *Manager) Stop(ctx context.Context, name string) (adapter.Status, error)
 	return st, nil
 }
 
+// Pause 暂停指定设备播放（渲染端幂等：已在 paused 时原样回执）。
+func (m *Manager) Pause(ctx context.Context, name string) (adapter.Status, error) {
+	t, err := m.target(name)
+	if err != nil {
+		return adapter.Status{}, err
+	}
+	st, err := m.client.Pause(ctx, t)
+	if err != nil {
+		return adapter.Status{}, offline(err)
+	}
+	return st, nil
+}
+
+// Seek 跳转指定设备播放位置（不改变播放状态；位置范围由渲染端裁决）。
+func (m *Manager) Seek(ctx context.Context, name string, positionMS int64) (adapter.Status, error) {
+	t, err := m.target(name)
+	if err != nil {
+		return adapter.Status{}, err
+	}
+	st, err := m.client.Seek(ctx, t, adapter.SeekRequest{PositionMS: positionMS})
+	if err != nil {
+		return adapter.Status{}, offline(err)
+	}
+	return st, nil
+}
+
 // Volume 设置指定设备音量。level <0 或 >100 拒绝并报 level_out_of_range
 // （不下发网络请求）；0 与 100 为合法边界。
 func (m *Manager) Volume(ctx context.Context, name string, level int) (adapter.Status, error) {

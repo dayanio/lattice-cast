@@ -379,6 +379,67 @@ func TestCastStopAndStatus(t *testing.T) {
 	assert.Empty(t, st.Status.Title, "stop 后媒体标题清空")
 }
 
+// ---- cast_pause / cast_seek ----
+
+// TestCastPause pause 后状态回 paused 且标题保留；未知设备报 unknown_device；
+// 成功与失败各落一行审计。
+func TestCastPause(t *testing.T) {
+	f := newFixture(t)
+	f.fake.SetPlaying("http://192.168.1.10:7810/media/abc", "夜曲", 180000)
+
+	var st struct {
+		Status adapter.Status `json:"status"`
+	}
+	f.callOK("cast_pause", map[string]any{"device": devName}, &st)
+	assert.Equal(t, "paused", st.Status.State)
+
+	f.callOK("cast_status", map[string]any{"device": devName}, &st)
+	assert.Equal(t, "paused", st.Status.State)
+	assert.Equal(t, "夜曲", st.Status.Title, "pause 后标题应保留")
+
+	got := f.callErr("cast_pause", map[string]any{"device": "nope"})
+	assert.Equal(t, "unknown_device: nope", got)
+
+	entries := f.auditEntries()
+	require.Len(t, entries, 3, "3 次 MCP 调用各一行审计（含失败；SetPlaying 是直调 Fake，不落审计）")
+	assert.Equal(t, "cast_pause", entries[0].Tool)
+	assert.True(t, entries[0].OK)
+	assert.Equal(t, "cast_pause", entries[2].Tool)
+	assert.False(t, entries[2].OK, "失败调用也须落审计")
+}
+
+// TestCastSeek 跳转位置生效且状态不变；负数报固定文本 position_out_of_range；
+// 未知设备报 unknown_device；每次调用（含失败）各落一行审计。
+func TestCastSeek(t *testing.T) {
+	f := newFixture(t)
+	f.fake.SetPlaying("http://192.168.1.10:7810/media/abc", "夜曲", 180000)
+
+	var st struct {
+		Status adapter.Status `json:"status"`
+	}
+	f.callOK("cast_seek", map[string]any{"device": devName, "position_ms": 90000}, &st)
+	assert.Equal(t, "playing", st.Status.State, "seek 不改变播放状态")
+
+	f.callOK("cast_status", map[string]any{"device": devName}, &st)
+	assert.Equal(t, int64(90000), st.Status.PositionMS, "进度应来自渲染端")
+	assert.Equal(t, "playing", st.Status.State)
+
+	got := f.callErr("cast_seek", map[string]any{"device": devName, "position_ms": -1})
+	assert.Equal(t, "position_out_of_range", got, "负数位置的错误文本固定")
+
+	got = f.callErr("cast_seek", map[string]any{"device": "nope", "position_ms": 1000})
+	assert.Equal(t, "unknown_device: nope", got)
+
+	entries := f.auditEntries()
+	require.Len(t, entries, 4, "4 次 MCP 调用各一行审计（含失败；SetPlaying 是直调 Fake，不落审计）")
+	assert.Equal(t, "cast_seek", entries[0].Tool)
+	assert.True(t, entries[0].OK)
+	for _, i := range []int{2, 3} {
+		assert.Equal(t, "cast_seek", entries[i].Tool)
+		assert.False(t, entries[i].OK, "失败调用也须落审计")
+	}
+}
+
 // ---- 审计 ----
 
 // TestAuditGrowsWithEveryCall 审计行数随每次调用（含失败）严格增长，
@@ -398,6 +459,9 @@ func TestAuditGrowsWithEveryCall(t *testing.T) {
 		{"cast_volume", map[string]any{"device": devName, "level": 101}, false},
 		{"cast_stop", map[string]any{"device": devName}, true},
 		{"cast_status", map[string]any{"device": devName}, true},
+		{"cast_pause", map[string]any{"device": devName}, true},
+		{"cast_seek", map[string]any{"device": devName, "position_ms": 1000}, true},
+		{"cast_seek", map[string]any{"device": devName, "position_ms": -5}, false}, // position_out_of_range
 	}
 
 	for i, step := range steps {

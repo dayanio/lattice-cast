@@ -157,9 +157,47 @@ func TestStop_IdlesDevice(t *testing.T) {
 	assert.Empty(t, st.Title, "stop 后媒体信息应清空")
 }
 
+// TestPause_PausesDevice Pause 暂停播放：playing → paused，媒体信息保留
+// （与 stop 不同，pause 不清标题）。
+func TestPause_PausesDevice(t *testing.T) {
+	fake := fakerenderer.New(devTok)
+	defer fake.Close()
+	fake.SetPlaying("http://x/y.mp3", "曲子", 1000)
+
+	m := newManager(t, newFakeCfg(fake))
+
+	st, err := m.Pause(context.Background(), devName)
+	require.NoError(t, err)
+	assert.Equal(t, "paused", st.State, "pause 响应应回执 paused")
+
+	st, err = m.Status(context.Background(), devName)
+	require.NoError(t, err)
+	assert.Equal(t, "paused", st.State)
+	assert.Equal(t, "曲子", st.Title, "pause 后媒体标题应保留")
+}
+
+// TestSeek_RoutesToDevice Seek 跳转位置：playing 态下位置生效且状态不变。
+func TestSeek_RoutesToDevice(t *testing.T) {
+	fake := fakerenderer.New(devTok)
+	defer fake.Close()
+	fake.SetPlaying("http://x/y.mp3", "曲子", 1000)
+
+	m := newManager(t, newFakeCfg(fake))
+
+	st, err := m.Seek(context.Background(), devName, 90000)
+	require.NoError(t, err)
+	assert.Equal(t, "playing", st.State, "seek 不改变播放状态")
+
+	st, err = m.Status(context.Background(), devName)
+	require.NoError(t, err)
+	assert.Equal(t, int64(90000), st.PositionMS, "Seek 须真的下发到该 Fake")
+	assert.Equal(t, "playing", st.State)
+}
+
 // ---- 错误路径 ----
 
-// TestOps_UnknownDevice 未知设备名：Play/Stop/Volume/Status 一律报 unknown_device。
+// TestOps_UnknownDevice 未知设备名：Play/Pause/Stop/Seek/Volume/Status 一律报
+// unknown_device。
 func TestOps_UnknownDevice(t *testing.T) {
 	fake := fakerenderer.New(devTok)
 	defer fake.Close()
@@ -171,7 +209,15 @@ func TestOps_UnknownDevice(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "unknown_device")
 
+	_, err = m.Pause(ctx, "no-such-device")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "unknown_device")
+
 	_, err = m.Stop(ctx, "no-such-device")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "unknown_device")
+
+	_, err = m.Seek(ctx, "no-such-device", 1000)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "unknown_device")
 
