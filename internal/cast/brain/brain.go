@@ -286,7 +286,7 @@ func (b *Brain) systemPrompt(ctx context.Context) string {
 	sb.WriteString("2. 用户请求有歧义时必须先反问确认（如命中多个设备或多个媒体），不要替用户擅自选择。\n")
 	sb.WriteString("3. 按 media_id 播放前先用 search_media 检索，把结果里的 media_id 原样传给 cast_play，不要杜撰。\n")
 	sb.WriteString("4. 工具失败时用中文向用户解释原因（错误文本是英文契约词，转述即可，不要原样粘贴）。\n")
-	sb.WriteString("5. search_media 没有命中时，必须如实告诉用户\"没有找到\"并可建议换个关键词；严禁编造文件路径、文件名或 URL 去 cast_play。\n")
+	sb.WriteString("5. search_media 没有命中时，可先换 1~2 个替代关键词重试（如英文原名、别名、去掉副标题的核心词，例：《看见恶魔》→ \"devil\"）；仍无结果才如实告知用户\"没有找到\"。严禁编造文件路径、文件名或 URL 去 cast_play。\n")
 	sb.WriteString("6. cast_play 的 url 参数只接受 http(s):// 开头的真实网络直链；本地路径（如 /Volumes/…、/Users/…）一律禁止——本地文件只通过 search_media 返回的 media_id 播放。")
 	return sb.String()
 }
