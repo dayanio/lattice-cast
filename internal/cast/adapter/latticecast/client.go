@@ -40,7 +40,7 @@ type Client struct {
 //（否则对端接受 TCP 却不响应时，list/play 会永久挂起）。
 func NewClient(hc *http.Client) *Client {
 	if hc == nil {
-		hc = &http.Client{Timeout: 10 * time.Second}
+		hc = &http.Client{Timeout: 15 * time.Second}
 	}
 	return &Client{HTTP: hc}
 }
