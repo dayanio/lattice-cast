@@ -144,8 +144,9 @@ func (b *Brain) Chat(ctx context.Context, sessionID, userText string) (<-chan Ch
 		b.sessions[sessionID] = sess
 	}
 	sess.msgs = append(sess.msgs, message{Role: "user", Content: userText})
-	msgs := b.snapshotLocked(sess)
 	b.mu.Unlock()
+	// 快照在 LLM 轮次前完成（含刚追加的 user 消息）；snapshot 自取锁。
+	msgs := b.snapshot(sess)
 
 	events := make(chan ChatEvent, 16)
 	go b.run(ctx, sess, events, msgs)
@@ -185,13 +186,17 @@ func (b *Brain) run(ctx context.Context, sess *session, events chan<- ChatEvent,
 			}
 			b.append(sess, message{Role: "tool", Content: content, ToolCallID: tc.ID})
 		}
-		msgs = b.snapshotLocked(sess) // 下一轮请求携带含工具结果的最新历史
+		msgs = b.snapshot(sess) // 下一轮请求携带含工具结果的最新历史（必须持锁：并发轮次同时在 append）
 	}
 	events <- ChatEvent{Type: "error", Text: "brain: tool_loop_limit_reached"}
 }
 
-// snapshotLocked 复制会话历史（调用方须持有 b.mu）。
-func (b *Brain) snapshotLocked(sess *session) []message {
+// snapshot 复制会话历史。自取锁：run 循环内的快照点位于两次 LLM 往返之间，
+// 不能跨网络往返持锁，故由本方法自行负责互斥（否则与并发轮次的加锁
+// append 构成数据竞争）。
+func (b *Brain) snapshot(sess *session) []message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	out := make([]message, len(sess.msgs))
 	copy(out, sess.msgs)
 	return out

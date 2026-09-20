@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,7 +46,8 @@ type stack struct {
 	auditPath string
 }
 
-func newStack(t *testing.T) *stack {
+// newStack 构造被测栈；wrap 可选地装饰执行核心（如并发测试的门控执行器）。
+func newStack(t *testing.T, wrap ...func(ToolExecutor) ToolExecutor) *stack {
 	t.Helper()
 
 	fake := fakerenderer.New(renderTok)
@@ -74,6 +76,9 @@ func newStack(t *testing.T) *stack {
 	srv := mcpserver.New(manager.New(cfg, lib, res), lib, res, audit, mcpserver.StaticToken(testToken))
 	// 编译期钉住：mcpserver 的执行核心适配器满足 brain.ToolExecutor。
 	var exec ToolExecutor = srv.Executor()
+	for _, w := range wrap {
+		exec = w(exec)
+	}
 
 	llm := fakellm.New()
 	br := New(config.Brain{
@@ -359,4 +364,108 @@ func TestTrimHistory(t *testing.T) {
 	assert.Equal(t, "system", trimmed[0].Role, "system 首条必须保留")
 	assert.NotEqual(t, "tool", trimmed[1].Role, "裁剪后不得以孤儿 tool 消息开头")
 	assert.Equal(t, "再来一首", trimmed[len(trimmed)-1].Content, "最新消息必须保留")
+}
+
+// ---- 同会话并发（回归：快照必须在持锁下完成）----
+
+// gateExec 拦截指定工具的首次执行：进入即发 entered 信号并等待 release——
+// 把第一轮对话停在工具循环中段，与第二轮对话构造真实的并发窗口。
+type gateExec struct {
+	inner   ToolExecutor
+	tool    string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gateExec) Execute(ctx context.Context, tool string, args json.RawMessage) (string, error) {
+	if tool == g.tool {
+		g.once.Do(func() { close(g.entered) })
+		<-g.release
+	}
+	return g.inner.Execute(ctx, tool, args)
+}
+
+// collectEvents 排空事件通道直到关闭（带超时上限）；供非测试 goroutine 使用
+// （不能 t.Fatal）。
+func collectEvents(events <-chan ChatEvent, timeout time.Duration) []ChatEvent {
+	var out []ChatEvent
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				return out
+			}
+			out = append(out, ev)
+		case <-time.After(timeout):
+			return out
+		}
+	}
+}
+
+// TestChat_ConcurrentSameSession 同一 session_id 上的两次并发 Chat：第一轮
+// 在 cast_play 执行中停靠，第二轮于停靠期间发起并跑完，随后放行第一轮。
+// 会话历史的每一点访问都必须持 b.mu——此前 run 循环内的快照调用未持锁，
+// 与并发轮次的加锁 append 构成数据竞争（-race 必报）。
+//
+// 注意结构：第二轮必须跑在独立 goroutine，且 release 前不得等它完成——
+// 先 join 再放行会形成贯穿两轮历史访问的 happens-before 链，把竞争
+// 恰好掩盖掉。
+func TestChat_ConcurrentSameSession(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s := newStack(t, func(inner ToolExecutor) ToolExecutor {
+		return &gateExec{inner: inner, tool: "cast_play", entered: entered, release: release}
+	})
+	items := s.lib.Search("sunset")
+	require.Len(t, items, 1)
+	argsJSON := fmt.Sprintf(`{"device":%q,"media_id":%q}`, devName, items[0].ID)
+	s.llm.Script(
+		fakellm.Resp{Body: toolCallBody("好的，马上为您播放。", "call-1", "cast_play", argsJSON)},
+		fakellm.Resp{Body: textBody("已经在客厅播放")},
+		fakellm.Resp{Body: textBody("好的")},
+	)
+
+	ctx := context.Background()
+	ev1, err := s.brain.Chat(ctx, "s1", "把夕阳短片投到客厅")
+	require.NoError(t, err)
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("未进入 cast_play 执行（门控失效）")
+	}
+
+	ev2Ch := make(chan []ChatEvent, 1)
+	go func() {
+		ev2, err := s.brain.Chat(ctx, "s1", "声音大一点")
+		if err != nil {
+			ev2Ch <- nil
+			return
+		}
+		ev2Ch <- collectEvents(ev2, 15*time.Second)
+	}()
+	close(release) // 不等待第二轮完成即放行（理由见函数注释）
+
+	ev2 := <-ev2Ch
+	got1 := drain(t, ev1)
+
+	// 松散断言（两轮的 LLM 请求指派次序本就不确定）：每轮恰有一个 final、
+	// 均无 error，第一轮恰好执行过一次 cast_play。
+	for _, got := range [][]ChatEvent{got1, ev2} {
+		finals := 0
+		for _, ev := range got {
+			assert.NotEqual(t, "error", ev.Type, "不应产生 error 事件：%v", got)
+			if ev.Type == "final" {
+				finals++
+			}
+		}
+		assert.Equal(t, 1, finals, "每轮应恰有一个 final：%v", got)
+	}
+	tools := 0
+	for _, ev := range got1 {
+		if ev.Type == "tool" && ev.Text == "cast_play" {
+			tools++
+		}
+	}
+	assert.Equal(t, 1, tools, "第一轮应恰执行一次 cast_play：%v", got1)
 }
