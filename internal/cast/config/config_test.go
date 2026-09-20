@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,4 +175,155 @@ func TestLoad_MissingFile(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), missing),
 		"错误信息应包含路径 %s，实际为: %v", missing, err)
+}
+
+// ---- brain 段（可选，v1.1：内置大脑 + 网页聊天）----
+
+// TestLoad_BrainDisabledByDefault 未写 brain 段（或写空段）＝禁用：Brain 为
+// 零值，既有配置解析不受影响（MCP-only 向后兼容）。
+func TestLoad_BrainDisabledByDefault(t *testing.T) {
+	path := writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Zero(t, cfg.Brain, "缺 brain 段 = 内置大脑禁用")
+
+	path = writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+brain:
+`)
+	cfg, err = Load(path)
+	require.NoError(t, err)
+	assert.Zero(t, cfg.Brain, "空 brain 段 = 内置大脑禁用")
+}
+
+// TestLoad_BrainSectionParse brain 段完整解析；base_url 显式给出时原样保留。
+func TestLoad_BrainSectionParse(t *testing.T) {
+	path := writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+brain:
+  provider: glm
+  api_key: sk-brain-123
+  model: glm-4.7
+  base_url: http://llm.example/v1
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "glm", cfg.Brain.Provider)
+	assert.Equal(t, "sk-brain-123", cfg.Brain.APIKey)
+	assert.Equal(t, "glm-4.7", cfg.Brain.Model)
+	assert.Equal(t, "http://llm.example/v1", cfg.Brain.BaseURL, "显式 base_url 原样保留")
+}
+
+// TestLoad_BrainBaseURLPreset base_url 留空时按 provider 填预设端点
+// （三家 provider 统一走 OpenAI 兼容 chat completions）；ollama 允许 api_key
+// 留空。
+func TestLoad_BrainBaseURLPreset(t *testing.T) {
+	tpl := `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+brain:
+  provider: %s
+  api_key: sk-x
+  model: m
+`
+	for provider, want := range map[string]string{
+		"glm":    "https://open.bigmodel.cn/api/paas/v4",
+		"claude": "https://api.anthropic.com/v1",
+		"ollama": "http://127.0.0.1:11434/v1",
+	} {
+		cfg, err := Load(writeTempConfig(t, fmt.Sprintf(tpl, provider)))
+		require.NoError(t, err, "provider %s", provider)
+		assert.Equal(t, want, cfg.Brain.BaseURL, "provider %s 应填预设端点", provider)
+	}
+
+	cfg, err := Load(writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+brain:
+  provider: ollama
+  model: qwen2.5
+`))
+	require.NoError(t, err, "ollama 允许 api_key 留空")
+	assert.Empty(t, cfg.Brain.APIKey)
+	assert.Equal(t, "http://127.0.0.1:11434/v1", cfg.Brain.BaseURL)
+}
+
+// TestLoad_BrainValidation brain 段校验：provider 必须是三家之一；api_key
+// 必填（ollama 除外）；model 必填。孤儿字段（provider 为空时给了 model）
+// 无副作用，与 reflux_token 的宽松处理一致。
+func TestLoad_BrainValidation(t *testing.T) {
+	t.Run("unknown provider", func(t *testing.T) {
+		path := writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+brain:
+  provider: openai
+  api_key: sk-x
+  model: gpt
+`)
+		_, err := Load(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "brain.provider")
+	})
+
+	t.Run("api_key required for glm", func(t *testing.T) {
+		path := writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+brain:
+  provider: glm
+  model: glm-4.7
+`)
+		_, err := Load(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "brain.api_key")
+	})
+
+	t.Run("model required", func(t *testing.T) {
+		path := writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+brain:
+  provider: glm
+  api_key: sk-x
+`)
+		_, err := Load(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "brain.model")
+	})
+
+	t.Run("orphan model without provider tolerated", func(t *testing.T) {
+		path := writeTempConfig(t, `
+media_base_url: http://10.0.0.2:7810
+auth_token: tok
+renderers:
+  dev-1: {room: dev, token: t}
+brain:
+  model: glm-4.7
+`)
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.Brain.Provider, "provider 为空 = 禁用")
+	})
 }

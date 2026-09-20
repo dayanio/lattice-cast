@@ -11,6 +11,8 @@
 //	cast_volume(device, level 0-100) → {"status":…}
 //
 // 每次调用（含失败）经 audit.Record 落一行 JSONL，agent 署名取自鉴权层。
+// 工具的执行核心（core* / doPlay）同时供内置大脑（internal/cast/brain）经
+// Executor() 适配器内部直调——与 MCP handler 完全同一份实现与审计路径。
 package mcpserver
 
 import (
@@ -155,32 +157,24 @@ func (s *Server) record(ctx context.Context, tool string, args, out any, err err
 	s.audit.Record(agentFrom(ctx), tool, string(argsJSON), result, err == nil, time.Since(start))
 }
 
-// ---- 八个工具 handler（返回 nil result：由 SDK 以 Out 填充 structuredContent）----
+// ---- 工具执行核心（MCP handler 与内置大脑的 ToolExecutor 适配器共用）----
+//
+// 每个核心只做参数裁决与业务执行，不记审计、不碰 MCP 类型：审计由两个调用
+// 方各自经 record 落行（同一 JSONL、同一格式）。
 
-func (s *Server) listDevices(ctx context.Context, _ *mcp.CallToolRequest, _ listIn) (*mcp.CallToolResult, []manager.Device, error) {
-	start := time.Now()
-	devices, err := s.mgr.List(ctx)
-	s.record(ctx, "list_cast_devices", listIn{}, devices, err, start)
-	return nil, devices, err
+func (s *Server) coreListDevices(ctx context.Context) ([]manager.Device, error) {
+	return s.mgr.List(ctx)
 }
 
-func (s *Server) searchMedia(ctx context.Context, _ *mcp.CallToolRequest, in searchIn) (*mcp.CallToolResult, []resolve.Item, error) {
-	start := time.Now()
-	items := s.res.Search(ctx, in.Query) // NAS ∪ reflux；reflux 失败已在 Resolver 内降级为 Warn + 仅 NAS，检索不失败
-	s.record(ctx, "search_media", in, items, nil, start)
-	return nil, items, nil
+// coreSearchMedia 检索永不失败：reflux 不可达已在 Resolver 内降级为仅 NAS。
+func (s *Server) coreSearchMedia(ctx context.Context, in searchIn) ([]resolve.Item, error) {
+	return s.res.Search(ctx, in.Query), nil
 }
 
-func (s *Server) play(ctx context.Context, _ *mcp.CallToolRequest, in playIn) (*mcp.CallToolResult, playOut, error) {
-	start := time.Now()
-	out, err := s.doPlay(ctx, in)
-	s.record(ctx, "cast_play", in, out, err, start)
-	return nil, out, err
-}
-
-// doPlay 实现 cast_play 的 exactly-one 规则与解析链：media_id → Resolver.ByID，
-// url → ByURL；解析错误原样透传（youtube_disabled / unknown_media_id 等），
-// 随后交 Manager.Play（unknown_device / device_offline 亦原样上抛）。
+// doPlay 是 cast_play 的执行核心：exactly-one 规则与解析链。media_id →
+// Resolver.ByID，url → ByURL；解析错误原样透传（youtube_disabled /
+// unknown_media_id 等），随后交 Manager.Play（unknown_device / device_offline
+// 亦原样上抛）。
 func (s *Server) doPlay(ctx context.Context, in playIn) (playOut, error) {
 	switch {
 	case in.MediaID == "" && in.URL == "":
@@ -207,56 +201,95 @@ func (s *Server) doPlay(ctx context.Context, in playIn) (playOut, error) {
 	return playOut{Status: st, Adapter: "latticecast"}, nil
 }
 
+func (s *Server) coreStop(ctx context.Context, in deviceIn) (statusOut, error) {
+	st, err := s.mgr.Stop(ctx, in.Device)
+	return statusOut{Status: st}, err
+}
+
+func (s *Server) corePause(ctx context.Context, in deviceIn) (statusOut, error) {
+	st, err := s.mgr.Pause(ctx, in.Device)
+	return statusOut{Status: st}, err
+}
+
+// coreSeek 含契约预检：负数位置以固定文本 position_out_of_range 拒绝，
+// 不下发网络请求。
+func (s *Server) coreSeek(ctx context.Context, in seekIn) (statusOut, error) {
+	if in.PositionMS < 0 {
+		return statusOut{}, errors.New("position_out_of_range")
+	}
+	st, err := s.mgr.Seek(ctx, in.Device, in.PositionMS)
+	return statusOut{Status: st}, err
+}
+
+// coreVolume 含契约预检：越界音量以固定文本 level_out_of_range 拒绝（0 与
+// 100 为合法边界），不下发网络请求；Manager 的带前缀版本仅供 Go 直调方使用。
+func (s *Server) coreVolume(ctx context.Context, in volumeIn) (statusOut, error) {
+	if in.Level < 0 || in.Level > 100 {
+		return statusOut{}, errors.New("level_out_of_range")
+	}
+	st, err := s.mgr.Volume(ctx, in.Device, in.Level)
+	return statusOut{Status: st}, err
+}
+
+func (s *Server) coreStatus(ctx context.Context, in deviceIn) (statusOut, error) {
+	st, err := s.mgr.Status(ctx, in.Device)
+	return statusOut{Status: st}, err
+}
+
+// ---- 八个工具 handler（薄壳：执行核心 + 审计）----
+
+func (s *Server) listDevices(ctx context.Context, _ *mcp.CallToolRequest, _ listIn) (*mcp.CallToolResult, []manager.Device, error) {
+	start := time.Now()
+	devices, err := s.coreListDevices(ctx)
+	s.record(ctx, "list_cast_devices", listIn{}, devices, err, start)
+	return nil, devices, err
+}
+
+func (s *Server) searchMedia(ctx context.Context, _ *mcp.CallToolRequest, in searchIn) (*mcp.CallToolResult, []resolve.Item, error) {
+	start := time.Now()
+	items, err := s.coreSearchMedia(ctx, in)
+	s.record(ctx, "search_media", in, items, err, start)
+	return nil, items, err
+}
+
+func (s *Server) play(ctx context.Context, _ *mcp.CallToolRequest, in playIn) (*mcp.CallToolResult, playOut, error) {
+	start := time.Now()
+	out, err := s.doPlay(ctx, in)
+	s.record(ctx, "cast_play", in, out, err, start)
+	return nil, out, err
+}
+
 func (s *Server) stop(ctx context.Context, _ *mcp.CallToolRequest, in deviceIn) (*mcp.CallToolResult, statusOut, error) {
 	start := time.Now()
-	st, err := s.mgr.Stop(ctx, in.Device)
-	out := statusOut{Status: st}
+	out, err := s.coreStop(ctx, in)
 	s.record(ctx, "cast_stop", in, out, err, start)
 	return nil, out, err
 }
 
 func (s *Server) pause(ctx context.Context, _ *mcp.CallToolRequest, in deviceIn) (*mcp.CallToolResult, statusOut, error) {
 	start := time.Now()
-	st, err := s.mgr.Pause(ctx, in.Device)
-	out := statusOut{Status: st}
+	out, err := s.corePause(ctx, in)
 	s.record(ctx, "cast_pause", in, out, err, start)
 	return nil, out, err
 }
 
 func (s *Server) seek(ctx context.Context, _ *mcp.CallToolRequest, in seekIn) (*mcp.CallToolResult, statusOut, error) {
 	start := time.Now()
-	if in.PositionMS < 0 {
-		// 契约错误文本为裸字符串（LLM 所见即 Content[0].Text），与
-		// cast_volume 的 level 预检同一模式：不下发网络请求。
-		err := errors.New("position_out_of_range")
-		s.record(ctx, "cast_seek", in, statusOut{}, err, start)
-		return nil, statusOut{}, err
-	}
-	st, err := s.mgr.Seek(ctx, in.Device, in.PositionMS)
-	out := statusOut{Status: st}
+	out, err := s.coreSeek(ctx, in)
 	s.record(ctx, "cast_seek", in, out, err, start)
 	return nil, out, err
 }
 
 func (s *Server) volume(ctx context.Context, _ *mcp.CallToolRequest, in volumeIn) (*mcp.CallToolResult, statusOut, error) {
 	start := time.Now()
-	if in.Level < 0 || in.Level > 100 {
-		// 契约错误文本为裸字符串（LLM 所见即 Content[0].Text）；
-		// Manager 的带前缀版本仅供 Go 直调方使用。
-		err := errors.New("level_out_of_range")
-		s.record(ctx, "cast_volume", in, statusOut{}, err, start)
-		return nil, statusOut{}, err
-	}
-	st, err := s.mgr.Volume(ctx, in.Device, in.Level)
-	out := statusOut{Status: st}
+	out, err := s.coreVolume(ctx, in)
 	s.record(ctx, "cast_volume", in, out, err, start)
 	return nil, out, err
 }
 
 func (s *Server) status(ctx context.Context, _ *mcp.CallToolRequest, in deviceIn) (*mcp.CallToolResult, statusOut, error) {
 	start := time.Now()
-	st, err := s.mgr.Status(ctx, in.Device)
-	out := statusOut{Status: st}
+	out, err := s.coreStatus(ctx, in)
 	s.record(ctx, "cast_status", in, out, err, start)
 	return nil, out, err
 }

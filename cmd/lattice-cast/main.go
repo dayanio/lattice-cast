@@ -24,10 +24,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dayanio/lattice-cast/internal/cast/brain"
 	"github.com/dayanio/lattice-cast/internal/cast/config"
 	"github.com/dayanio/lattice-cast/internal/cast/manager"
 	"github.com/dayanio/lattice-cast/internal/cast/mcpserver"
 	"github.com/dayanio/lattice-cast/internal/cast/resolve"
+	"github.com/dayanio/lattice-cast/internal/cast/webchat"
 )
 
 // Version 版本号；发布时经 -ldflags "-X main.Version=v0.1.0" 覆写。
@@ -62,6 +64,8 @@ func main() {
 //
 //	config.Load → OpenAudit → Library.Rescan（失败仅告警，以空库继续）→
 //	MediaServer.Start → Resolver → manager.New → mcpserver.New → http.Server。
+//	配置启用 brain（provider 非空）时再装配内置大脑与 /chat 网页聊天路由
+//	（同监听、同 Bearer 令牌）；未启用时 handler 与既有行为完全一致。
 //
 // 任一步失败：先关闭已启动的组件，再返回错误（main 以非零码退出）。
 func run(configPath string) error {
@@ -106,7 +110,23 @@ func run(configPath string) error {
 	mgr := manager.New(cfg, lib, res)
 	srv := mcpserver.New(mgr, lib, res, audit, mcpserver.StaticToken(cfg.AuthToken))
 
-	httpSrv := &http.Server{Handler: srv.HTTP()}
+	// 内置大脑 + 网页聊天（可选，v1.1）：仅在配置了 brain.provider 时装配。
+	// 工具执行经 mcpserver.Executor 直调同一执行核心（内部调用，不走 HTTP
+	// 自环），/chat 路由与 MCP 共用监听与 Bearer 令牌；未启用时 handler
+	// 保持原样（零 brain 路径与既有行为逐字节一致）。
+	var handler http.Handler = srv.HTTP()
+	if cfg.Brain.Provider != "" {
+		br := brain.New(cfg.Brain, srv.Executor(), nil)
+		wc := webchat.New(br, mcpserver.StaticToken(cfg.AuthToken))
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /chat", wc.Page)
+		mux.HandleFunc("POST /chat/api/message", wc.Message)
+		mux.Handle("/", srv.HTTP())
+		handler = mux
+		slog.Info("brain enabled", "provider", cfg.Brain.Provider, "model", cfg.Brain.Model)
+	}
+
+	httpSrv := &http.Server{Handler: handler}
 	ln, err := net.Listen("tcp", cfg.MCPListen) // 同步绑定：端口占用即刻致命
 	if err != nil {
 		_ = media.Close()
