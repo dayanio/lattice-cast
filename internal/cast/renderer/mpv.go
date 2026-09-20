@@ -149,6 +149,11 @@ func (m *MpvController) spawnLocked() error {
 		"--keep-open=yes", // 播完不退出（eof 后回 idle 而非退出进程）
 	}
 	args = append(args, m.extraArgs...)
+	// 排障闸（临时诊断用）：LATTICECAST_MPV_LOG 非空时把 mpv 自身日志落到该
+	// 文件（含退出原因），用于定位 mpv 静默退出的根因。
+	if p := os.Getenv("LATTICECAST_MPV_LOG"); p != "" {
+		args = append(args, "--log-file="+p)
+	}
 	m.cmd = exec.Command(m.binPath, args...)
 	// 静默 mpv 自身输出：测试要求 pristine output，排障靠 IPC 层报错。
 	m.cmd.Stdout = io.Discard
@@ -346,6 +351,14 @@ func (m *MpvController) load(url, title string, positionMS int64) error {
 		args = append(args, "-1", "start=+"+sec)
 	}
 	if _, err := m.command(args...); err != nil {
+		return err
+	}
+	// 新会话起播必须解除遗留暂停：mpv 的 pause 属性跨 loadfile 粘滞（0.41
+	// 实测 pause=yes 下 loadfile 新条目停在第 0 帧，time-pos=0、eof=false、
+	// idle=false，起播确认三条件全不命中，干等 10s 误报 source unplayable，
+	// agent 侧 10s 超时先到包装成 device_offline——线上 /pause 后重播连续
+	// 失败直至渲染端重启）。/play 语义即开始播放，随 load 显式 set pause no。
+	if _, err := m.command("set", "pause", "no"); err != nil {
 		return err
 	}
 	if title != "" {

@@ -167,9 +167,10 @@ func TestIpcLoad_SendsLoadfileThenTitle(t *testing.T) {
 	assert.Contains(t, f.commands(), []any{"get_property", "time-pos"})
 
 	cmds := payloadCommands(f)
-	require.Len(t, cmds, 2)
+	require.Len(t, cmds, 3)
 	assert.Equal(t, []any{"loadfile", "http://192.168.1.10:7810/media/abc123", "replace"}, cmds[0])
-	assert.Equal(t, []any{"set", "force-media-title", "星际穿越"}, cmds[1])
+	assert.Equal(t, []any{"set", "pause", "no"}, cmds[1], "load 后须解除遗留暂停（pause 跨 loadfile 粘滞）")
+	assert.Equal(t, []any{"set", "force-media-title", "星际穿越"}, cmds[2])
 }
 
 func TestIpcLoad_EmptyTitleSkipsTitleSet(t *testing.T) {
@@ -181,8 +182,9 @@ func TestIpcLoad_EmptyTitleSkipsTitleSet(t *testing.T) {
 
 	// 位置 0：plain 3 元素 loadfile，无 start 选项，无标题覆写
 	cmds := payloadCommands(f)
-	require.Len(t, cmds, 1)
+	require.Len(t, cmds, 2)
 	assert.Equal(t, []any{"loadfile", "http://x/a.mp4", "replace"}, cmds[0])
+	assert.Equal(t, []any{"set", "pause", "no"}, cmds[1])
 }
 
 func TestIpcLoad_ResumePosition_FoldsIntoStartOption(t *testing.T) {
@@ -198,9 +200,10 @@ func TestIpcLoad_ResumePosition_FoldsIntoStartOption(t *testing.T) {
 	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "星际穿越", 12500))
 
 	cmds := payloadCommands(f)
-	require.Len(t, cmds, 2, "start 折进 loadfile，不应另发 seek")
+	require.Len(t, cmds, 3, "start 折进 loadfile，不应另发 seek")
 	assert.Equal(t, []any{"loadfile", "http://x/a.mp4", "replace", "-1", "start=+12.5"}, cmds[0])
-	assert.Equal(t, []any{"set", "force-media-title", "星际穿越"}, cmds[1])
+	assert.Equal(t, []any{"set", "pause", "no"}, cmds[1])
+	assert.Equal(t, []any{"set", "force-media-title", "星际穿越"}, cmds[2])
 }
 
 func TestIpcLoad_ResumePosition_SubSecondMs(t *testing.T) {
@@ -212,8 +215,9 @@ func TestIpcLoad_ResumePosition_SubSecondMs(t *testing.T) {
 	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "", 90250))
 
 	cmds := payloadCommands(f)
-	require.Len(t, cmds, 1)
+	require.Len(t, cmds, 2)
 	assert.Equal(t, []any{"loadfile", "http://x/a.mp4", "replace", "-1", "start=+90.25"}, cmds[0])
+	assert.Equal(t, []any{"set", "pause", "no"}, cmds[1])
 }
 
 func TestIpcPause_FromPlaying_SetsPauseTrue(t *testing.T) {
@@ -546,6 +550,54 @@ func TestMpvIntegration_LoadBadSource_HonestError(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("好源应恢复 playing 且时长 60000ms，5s 内始终为 %+v", st)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestMpvIntegration_PlayClearsStickyPause 是"暂停后重播必须真的在播"的回归
+// （线上事故：用户在 mpv 窗口按过空格 / 走过 /pause 后，pause=yes 属性跨
+// loadfile 粘滞——mpv 0.41 实测：pause=yes 下 loadfile 新条目停在第 0 帧，
+// time-pos=0、eof-reached=false、idle-active=false，起播确认三条件全不命中，
+// 干等 10s 后报 "source unplayable"；agent 侧 10s 客户端超时先到，包装成
+// device_offline。此后每次 /play 全部失败，直到渲染端重启）。契约：
+//   - Load（新播放会话）必须解除上一场遗留的暂停态；
+//   - 暂停后再次 Load，起播确认须快速成功，且状态为 playing、位置在推进。
+//
+// 修复前形态下本测试必然失败：第二次 Load 在 10s 起播确认后报错（RED）。
+// 无头启动（--vo=null --ao=null）保持测试不侵入桌面。
+func TestMpvIntegration_PlayClearsStickyPause(t *testing.T) {
+	if _, err := exec.LookPath("mpv"); err != nil {
+		t.Skip("mpv 未安装，跳过真实进程集成测试")
+	}
+
+	media := writeSineWAV(t, 60)
+	ctl, err := newMpvController("mpv", "--vo=null", "--ao=null")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ctl.Close() })
+
+	ctx := context.Background()
+
+	// 第一场：起播 → 协议 /pause 落下暂停（等价于用户空格）
+	require.NoError(t, ctl.Load(ctx, media, "正弦波", 0))
+	require.NoError(t, ctl.Pause())
+
+	// 第二场：暂停态未清时的新会话。旧形态：mpv 停在第 0 帧，
+	// Load 干等 10s 后报 "did not start playback within 10s: source unplayable"。
+	start := time.Now()
+	require.NoError(t, ctl.Load(ctx, media, "正弦波", 0),
+		"暂停后的 /play 必须重新起播，不得误判为不可播源")
+	t.Logf("暂停后 Load 在 %v 内返回", time.Since(start).Round(time.Millisecond))
+
+	// 且是真的在播：位置从 0 推进（旧形态即使不报错也停在 0）
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		st := ctl.Status()
+		if st.State == "playing" && st.PositionMS > 500 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("重播后应 playing 且位置推进 >500ms，3s 内始终为 %+v", st)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
