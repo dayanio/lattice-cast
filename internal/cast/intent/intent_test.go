@@ -526,6 +526,49 @@ func TestSeek_Backward(t *testing.T) {
 	assert.Contains(t, finalOf(t, events), "后退 30 分钟")
 }
 
+// TestSeek_AbsoluteSeconds 秒形态的绝对跳转（规则③的秒形态，Fix round 1）：
+// 阿拉伯与中文数字，final 以「秒」表述。
+func TestSeek_AbsoluteSeconds(t *testing.T) {
+	cases := []struct {
+		text   string
+		wantMS int64
+	}{
+		{"快进到第90秒", 90000},
+		{"快进到十五秒", 15000},
+	}
+	for _, c := range cases {
+		f := &fakeExec{respond: seekScript(60000)}
+		r := newRouter(f)
+
+		handled, events := r.TryHandle(context.Background(), c.text)
+		require.True(t, handled, c.text)
+		assert.Equal(t, float64(c.wantMS), f.argsOf(t, "cast_seek")["position_ms"], c.text)
+		final := finalOf(t, events)
+		assert.Contains(t, final, "快进到", c.text)
+		assert.Contains(t, final, "秒", c.text)
+	}
+}
+
+// TestSeek_RelativeSeconds 秒形态的相对跳转：现位置 ± N 秒；final 单位用
+// 「秒」、位置仍以分钟表述。
+func TestSeek_RelativeSeconds(t *testing.T) {
+	f := &fakeExec{respond: seekScript(600000)}
+	r := newRouter(f)
+	handled, events := r.TryHandle(context.Background(), "快进30秒")
+	require.True(t, handled)
+	assert.Equal(t, float64(630000), f.argsOf(t, "cast_seek")["position_ms"])
+	final := finalOf(t, events)
+	assert.Contains(t, final, "快进 30 秒")
+	assert.Contains(t, final, "第 10 分钟", "630000ms 应折算为第 10 分钟")
+
+	f2 := &fakeExec{respond: seekScript(600000)}
+	r2 := newRouter(f2)
+	handled, events2 := r2.TryHandle(context.Background(), "后退十五秒")
+	require.True(t, handled)
+	assert.Equal(t, float64(585000), f2.argsOf(t, "cast_seek")["position_ms"])
+	assert.Contains(t, finalOf(t, events2), "后退 15 秒")
+}
+
 // ---- 音量 ----
 
 func volumeScript(cur int64, state string) func(tool, _ string) (string, error) {

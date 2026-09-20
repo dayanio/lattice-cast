@@ -20,9 +20,9 @@ var (
 	rePause         = regexp.MustCompile(`^暂停(一下)?$`)
 	reResume        = regexp.MustCompile(`^(继续(播放)?|接着播)$`)
 	reStop          = regexp.MustCompile(`^(停止|停掉|别播了)$`)
-	reSeekTo        = regexp.MustCompile(`^快进到第?(?P<n>[\d一二两三四五六七八九十]+)分钟$`)
-	reSeekForward   = regexp.MustCompile(`^快进(?P<n>[\d一二两三四五六七八九十]+)分钟$`)
-	reSeekBackward  = regexp.MustCompile(`^后退(?P<n>[\d一二两三四五六七八九十]+)分钟$`)
+	reSeekTo        = regexp.MustCompile(`^快进到第?(?P<n>[\d一二两三四五六七八九十]+)(?P<unit>分钟|秒)$`)
+	reSeekForward   = regexp.MustCompile(`^快进(?P<n>[\d一二两三四五六七八九十]+)(?P<unit>分钟|秒)$`)
+	reSeekBackward  = regexp.MustCompile(`^后退(?P<n>[\d一二两三四五六七八九十]+)(?P<unit>分钟|秒)$`)
 	reVolumeSet     = regexp.MustCompile(`^音量调到(?P<n>[\d一二两三四五六七八九十]+)$`)
 	reVolumeUp      = regexp.MustCompile(`^大点声$`)
 	reVolumeDown    = regexp.MustCompile(`^小点声$`)
@@ -309,36 +309,46 @@ func (r *Router) handleResume(ctx context.Context) (bool, []ChatEvent) {
 
 // ---- 快进 / 后退 ----
 
-// seekAbsolute 「快进到{N}分钟」：绝对跳转（N 分钟 → 毫秒）。
+// unitMS 把捕获的时间单位换算成毫秒（正则只可能给出 分钟/秒 两种）。
+func unitMS(unit string) int64 {
+	if unit == "秒" {
+		return 1000
+	}
+	return 60000
+}
+
+// seekAbsolute 「快进到第?{N}分钟/秒」：绝对跳转（N × 单位换算毫秒）。
 func (r *Router) seekAbsolute(ctx context.Context, msg string) (bool, []ChatEvent) {
 	m := reSeekTo.FindStringSubmatch(msg)
-	minutes, ok := parseCount(m[reSeekTo.SubexpIndex("n")])
+	count, ok := parseCount(m[reSeekTo.SubexpIndex("n")])
 	if !ok {
 		return false, nil
 	}
+	unit := m[reSeekTo.SubexpIndex("unit")]
 	var events []ChatEvent
 	dev, done := r.pickOnline(ctx, &events, "请问要在哪一台快进")
 	if done {
 		return true, events
 	}
 	if _, err := r.call(ctx, &events, "cast_seek", map[string]any{
-		"device": dev.Name, "position_ms": int64(minutes) * 60000,
+		"device": dev.Name, "position_ms": int64(count) * unitMS(unit),
 	}); err != nil {
 		toolFail(&events, "跳转", err)
 		return true, events
 	}
-	events = append(events, ChatEvent{Type: evFinal, Text: fmt.Sprintf("已快进到第 %d 分钟。", minutes)})
+	events = append(events, ChatEvent{Type: evFinal, Text: fmt.Sprintf("已快进到第 %d %s。", count, unit)})
 	return true, events
 }
 
-// seekRelative 「快进{N}分钟 / 后退{N}分钟」：先读当前状态再相对跳转；
+// seekRelative 「快进{N}分钟/秒 / 后退{N}分钟/秒」：先读当前状态再相对跳转；
 // 后退越过片头时钳到 0（负数会被渲染端裁决层拒绝，这里就地收好）。
 func (r *Router) seekRelative(ctx context.Context, msg string, re *regexp.Regexp, back bool) (bool, []ChatEvent) {
 	m := re.FindStringSubmatch(msg)
-	minutes, ok := parseCount(m[re.SubexpIndex("n")])
+	count, ok := parseCount(m[re.SubexpIndex("n")])
 	if !ok {
 		return false, nil
 	}
+	unit := m[re.SubexpIndex("unit")]
 	var events []ChatEvent
 	question := "请问要在哪一台快进"
 	if back {
@@ -358,9 +368,10 @@ func (r *Router) seekRelative(ctx context.Context, msg string, re *regexp.Regexp
 		toolFail(&events, "解析状态", err)
 		return true, events
 	}
-	target := so.Status.PositionMS + int64(minutes)*60000
+	delta := int64(count) * unitMS(unit)
+	target := so.Status.PositionMS + delta
 	if back {
-		target = so.Status.PositionMS - int64(minutes)*60000
+		target = so.Status.PositionMS - delta
 		if target < 0 {
 			target = 0
 		}
@@ -375,7 +386,7 @@ func (r *Router) seekRelative(ctx context.Context, msg string, re *regexp.Regexp
 	if back {
 		verb = "已后退"
 	}
-	events = append(events, ChatEvent{Type: evFinal, Text: fmt.Sprintf("%s %d 分钟，现在第 %d 分钟。", verb, minutes, target/60000)})
+	events = append(events, ChatEvent{Type: evFinal, Text: fmt.Sprintf("%s %d %s，现在第 %d 分钟。", verb, count, unit, target/60000)})
 	return true, events
 }
 
