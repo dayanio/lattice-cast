@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"math"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -135,13 +137,36 @@ func newTestController(t *testing.T, f *fakeMpv) *MpvController {
 	return newIpcController(f.sockPath)
 }
 
+// armStartConfirm 把 fake 预置成"已起播"形态（time-pos>0 即 started）：Load 的
+// 起播确认轮询读到即返回。供组帧单测在下发路径上叠加确认通路。
+func armStartConfirm(f *fakeMpv) {
+	f.setProp("time-pos", 1.5)
+}
+
+// payloadCommands 过滤出组帧断言关心的载荷命令（loadfile/set/seek/stop…），
+// 剔除起播确认轮询产生的 get_property 探测帧。
+func payloadCommands(f *fakeMpv) [][]any {
+	var out [][]any
+	for _, cmd := range f.commands() {
+		if len(cmd) > 0 && cmd[0] == "get_property" {
+			continue
+		}
+		out = append(out, cmd)
+	}
+	return out
+}
+
 func TestIpcLoad_SendsLoadfileThenTitle(t *testing.T) {
 	f := newFakeMpv(t)
+	armStartConfirm(f)
 	ctl := newTestController(t, f)
 
 	require.NoError(t, ctl.Load(context.Background(), "http://192.168.1.10:7810/media/abc123", "星际穿越", 0))
 
-	cmds := f.commands()
+	// 起播确认发生在下发之后：确有 time-pos 探测（fire-and-forget 旧形态没有）
+	assert.Contains(t, f.commands(), []any{"get_property", "time-pos"})
+
+	cmds := payloadCommands(f)
 	require.Len(t, cmds, 2)
 	assert.Equal(t, []any{"loadfile", "http://192.168.1.10:7810/media/abc123", "replace"}, cmds[0])
 	assert.Equal(t, []any{"set", "force-media-title", "星际穿越"}, cmds[1])
@@ -149,16 +174,20 @@ func TestIpcLoad_SendsLoadfileThenTitle(t *testing.T) {
 
 func TestIpcLoad_EmptyTitleSkipsTitleSet(t *testing.T) {
 	f := newFakeMpv(t)
+	armStartConfirm(f)
 	ctl := newTestController(t, f)
 
 	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "", 0))
 
 	// 位置 0：plain 3 元素 loadfile，无 start 选项，无标题覆写
-	assert.Equal(t, [][]any{{"loadfile", "http://x/a.mp4", "replace"}}, f.commands())
+	cmds := payloadCommands(f)
+	require.Len(t, cmds, 1)
+	assert.Equal(t, []any{"loadfile", "http://x/a.mp4", "replace"}, cmds[0])
 }
 
 func TestIpcLoad_ResumePosition_FoldsIntoStartOption(t *testing.T) {
 	f := newFakeMpv(t)
+	armStartConfirm(f)
 	ctl := newTestController(t, f)
 
 	// 12500ms → 恰好 5 元素：["loadfile", url, "replace", "-1", "start=+12.5"]
@@ -168,7 +197,7 @@ func TestIpcLoad_ResumePosition_FoldsIntoStartOption(t *testing.T) {
 	// 不能 load 后补 seek）
 	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "星际穿越", 12500))
 
-	cmds := f.commands()
+	cmds := payloadCommands(f)
 	require.Len(t, cmds, 2, "start 折进 loadfile，不应另发 seek")
 	assert.Equal(t, []any{"loadfile", "http://x/a.mp4", "replace", "-1", "start=+12.5"}, cmds[0])
 	assert.Equal(t, []any{"set", "force-media-title", "星际穿越"}, cmds[1])
@@ -176,12 +205,15 @@ func TestIpcLoad_ResumePosition_FoldsIntoStartOption(t *testing.T) {
 
 func TestIpcLoad_ResumePosition_SubSecondMs(t *testing.T) {
 	f := newFakeMpv(t)
+	armStartConfirm(f)
 	ctl := newTestController(t, f)
 
 	// 非整百毫秒：-1 精度浮点格式化保留全部毫秒位（90250 → "start=+90.25"）
 	require.NoError(t, ctl.Load(context.Background(), "http://x/a.mp4", "", 90250))
 
-	assert.Equal(t, [][]any{{"loadfile", "http://x/a.mp4", "replace", "-1", "start=+90.25"}}, f.commands())
+	cmds := payloadCommands(f)
+	require.Len(t, cmds, 1)
+	assert.Equal(t, []any{"loadfile", "http://x/a.mp4", "replace", "-1", "start=+90.25"}, cmds[0])
 }
 
 func TestIpcPause_FromPlaying_SetsPauseTrue(t *testing.T) {
@@ -439,10 +471,90 @@ func TestMpvIntegration_ResumePosition(t *testing.T) {
 	}
 }
 
+// TestMpvIntegration_LoadBadSource_HonestError 是"起播确认"的端到端回归
+// （线上事故：agent 脑补了不存在的 NAS 路径，loadfile 对不可播源照样回
+// success，渲染端 /play 谎报 {"ok":true,"state":"playing"}，mpv 异步加载
+// 失败后静默回 idle——调用方从此以为在播）。无头启动（--vo=null --ao=null）。
+// 契约：
+//   - Controller.Load 对不可播源（闭合端口 URL）必须有界（~10s）返回 error；
+//   - /play 同源回 {"ok":false,"state":"error"}（HTTP 200，应用层失败），
+//     error 态粘滞（/status 恒 error、信息清零）；
+//   - 下一次 /play 好源恢复 playing（error 只被下一次 /play 打破）。
+//
+// 修复前（fire-and-forget）形态下本测试必然失败：loadfile 对闭合端口 URL
+// 照样回 success，Load 返回 nil、/play 回 {"ok":true,"state":"playing"}——
+// 第 1) 步 require.Error 与第 2) 步 ok=false 断言分别落空（本机实测：闭合
+// 端口 loadfile 响应 success，约 5.9s 后 idle-active 翻回 true 而始终无
+// time-pos，旧代码对这一切无感知）。
+func TestMpvIntegration_LoadBadSource_HonestError(t *testing.T) {
+	if _, err := exec.LookPath("mpv"); err != nil {
+		t.Skip("mpv 未安装，跳过真实进程集成测试")
+	}
+
+	ctl, err := newMpvController("mpv", "--vo=null", "--ao=null")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ctl.Close() })
+
+	const badURL = "http://127.0.0.1:1/x.mp4" // 闭合端口：连接必被拒
+
+	// 1) Controller 层：不可播源必须报错，且有界返回
+	start := time.Now()
+	err = ctl.Load(context.Background(), badURL, "幻觉片源", 0)
+	elapsed := time.Since(start)
+	require.Error(t, err, "不可播源 loadfile 异步失败，Load 不得谎报成功")
+	t.Logf("不可播源 Load 在 %v 后返回: %v", elapsed.Round(time.Millisecond), err)
+	assert.LessOrEqual(t, elapsed, 12*time.Second, "起播确认应在有界窗口内返回")
+
+	// 2) Server 层：/play 同源 → ok=false + state=error，且 error 粘滞
+	srv := NewServer("s3cret", "卧室", "test-renderer", 0, ctl)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	code, body := rawDo(t, ts.URL, http.MethodPost, "/play", "s3cret", `{"url":"`+badURL+`"}`)
+	require.Equal(t, http.StatusOK, code)
+	var resp cmdResp
+	require.NoError(t, json.Unmarshal([]byte(body), &resp))
+	assert.False(t, resp.OK, "不可播源 /play 不得回 ok=true（旧形态即败于此）")
+	assert.Equal(t, stateError, resp.State)
+	assert.NotEmpty(t, resp.Error)
+
+	code, body = rawDo(t, ts.URL, http.MethodGet, "/status", "s3cret", "")
+	require.Equal(t, http.StatusOK, code)
+	var st statusResp
+	require.NoError(t, json.Unmarshal([]byte(body), &st))
+	assert.Equal(t, stateError, st.State, "error 态粘滞：/status 恒 error")
+	assert.NotEmpty(t, st.Error)
+	assert.Zero(t, st.PositionMS)
+	assert.Zero(t, st.DurationMS)
+
+	// 3) 恢复：error 只被下一次 /play（好源）打破——且这次 /play 是真的在播
+	media := writeSineWAV(t, 60)
+	code, body = rawDo(t, ts.URL, http.MethodPost, "/play", "s3cret",
+		`{"url":"`+media+`","title":"正弦波"}`)
+	require.Equal(t, http.StatusOK, code)
+	require.NoError(t, json.Unmarshal([]byte(body), &resp))
+	require.True(t, resp.OK, "好源 /play 应回 ok=true，body=%s", body)
+	assert.Equal(t, statePlaying, resp.State)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		code, body = rawDo(t, ts.URL, http.MethodGet, "/status", "s3cret", "")
+		require.Equal(t, http.StatusOK, code)
+		require.NoError(t, json.Unmarshal([]byte(body), &st))
+		if st.State == statePlaying && st.DurationMS == 60000 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("好源应恢复 playing 且时长 60000ms，5s 内始终为 %+v", st)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // TestMpvIntegration_RespawnAfterQuit 是真实 mpv 的"用户按 q 退出后必须能
 // 复活"回归（线上事故：mpv 进程一生只拉起一次，用户 q 退出后 socket 拒连，
 // 此后每个 /play 永久失败，渲染端"变砖"直到整个进程重启）。无头启动
-//（--vo=null --ao=null）。契约：
+// （--vo=null --ao=null）。契约：
 //   - 外部杀死进程后，Status 恒 idle（只读路径不触发复活）；
 //   - 下一次 Load 按需重拉全新 mpv epoch（socket/tmpdir 换代），首次即成功；
 //   - Close 只杀当前 epoch、清当前 tmpdir（reaper 独占 Wait 不受换代影响）。

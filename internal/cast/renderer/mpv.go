@@ -27,6 +27,12 @@ const (
 	ipcDialTimeout   = 2 * time.Second
 	ipcBootTimeout   = 5 * time.Second
 	closeReapTimeout = 2 * time.Second
+
+	// 起播确认窗口：loadfile 对不可播源也回 success（mpv 异步验证媒体，本机
+	// 实测闭合端口 URL 约 5.9s 后才放弃、本地不存在文件约 110ms），故下发后
+	// 须继续观测真实起播——上限 10s、每 100ms 轮询一次 IPC 属性。
+	loadStartTimeout = 10 * time.Second
+	loadStartPoll    = 100 * time.Millisecond
 )
 
 // MpvController 是 Controller 的 mpv 生产实现：整个进程生命周期内拉起一个
@@ -248,7 +254,14 @@ func (m *MpvController) killEpochLocked() {
 // 存活（用户 q 退出 / 崩溃后在此重拉全新 mpv，首次 Load 即成功）；若进程在
 // 检查与命令之间死亡（reaper 收尸未落、socket 先拒连的窗口），命令返回
 // 连接级故障时换代重试一次。命令级错误（如 invalid parameter）不触发重生。
-func (m *MpvController) Load(_ context.Context, url, title string, positionMS int64) error {
+//
+// 起播确认：loadfile 的成功回执不代表媒体可播——mpv 异步验证媒体，对不存在/
+// 不可达的源照样回 success，随后才静默退回 idle（线上事故：/play 谎报
+// playing，调用方一直以为在播）。故下发后经 awaitPlaybackStart 有界等待真实
+// 起播（在调用方 ctx 上，可取消），不可播源如实报错——Server 的 /play 据此
+// 进 error 态（protocol.md 第六节）。确认阶段命中连接级故障同样走上面的换代
+// 重试路径。
+func (m *MpvController) Load(ctx context.Context, url, title string, positionMS int64) error {
 	m.mu.Lock()
 	err := m.ensureProcessLocked()
 	m.mu.Unlock()
@@ -256,14 +269,73 @@ func (m *MpvController) Load(_ context.Context, url, title string, positionMS in
 		return err
 	}
 
-	if err := m.load(url, title, positionMS); !isConnErr(err) {
+	if err := m.loadAndConfirmStart(ctx, url, title, positionMS); !isConnErr(err) {
 		return err
 	}
 	// epoch 在检查与命令之间死亡：换代重生后重试一次
 	if err := m.respawn(); err != nil {
 		return err
 	}
-	return m.load(url, title, positionMS)
+	return m.loadAndConfirmStart(ctx, url, title, positionMS)
+}
+
+// loadAndConfirmStart 下发 loadfile（与可选的标题覆写）后等待真实起播。
+func (m *MpvController) loadAndConfirmStart(ctx context.Context, url, title string, positionMS int64) error {
+	if err := m.load(url, title, positionMS); err != nil {
+		return err
+	}
+	return m.awaitPlaybackStart(ctx)
+}
+
+// awaitPlaybackStart 起播确认：loadfile 之后有界轮询（10s 上限、100ms 间隔）
+// IPC 属性，直到出现明确结论，不再 fire-and-forget：
+//   - started：time-pos 可用且 > 0（解码真正到达播放）→ 立即成功返回；
+//   - eof-reached=true 且 time-pos 停在 0（打开即完的空源）→ 不可播；
+//   - idle-active 翻回 true（曾离开 idle 又回来：mpv 已放弃加载）→ 不可播；
+//   - 超时 / 调用方 ctx 取消 → 失败。
+//
+// 属性读取的 "property unavailable" 是命令级错误（mpv 尚无答案，继续等）；
+// 连接级故障上抛（Load 据此换代重试）。等待发生在调用方 ctx 上，取消即中止。
+// 轮询按次进出 m.mu，不跨睡眠持锁，/status 等并发命令不受阻塞。
+func (m *MpvController) awaitPlaybackStart(ctx context.Context) error {
+	deadline := time.Now().Add(loadStartTimeout)
+	ticker := time.NewTicker(loadStartPoll)
+	defer ticker.Stop()
+
+	var leftIdle bool // 已观察到 idle-active=false：loadfile 已被 mpv 接受
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("mpv load aborted: %w", ctx.Err())
+		case <-ticker.C:
+		}
+
+		// started：解码已到达播放（起播即返回，不等满窗口）
+		if v, err := m.getFloat("time-pos"); err == nil && v > 0 {
+			return nil
+		} else if isConnErr(err) {
+			return fmt.Errorf("mpv ipc lost while confirming start: %w", err)
+		}
+		// eof：媒体打开即完（time-pos 未越过 0）——不可播的空源
+		if eof, err := m.getBool("eof-reached"); err == nil && eof {
+			return errors.New("mpv reached eof at position 0: source unplayable")
+		} else if isConnErr(err) {
+			return fmt.Errorf("mpv ipc lost while confirming start: %w", err)
+		}
+		// idle 回环：曾离开 idle（load 被接受）又翻回 idle——加载失败
+		if idle, err := m.getBool("idle-active"); err == nil {
+			if idle && leftIdle {
+				return errors.New("mpv returned to idle without playback: source unplayable")
+			}
+			leftIdle = !idle
+		} else if isConnErr(err) {
+			return fmt.Errorf("mpv ipc lost while confirming start: %w", err)
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("mpv did not start playback within %s: source unplayable", loadStartTimeout)
+		}
+	}
 }
 
 // load 仅下发 loadfile（与可选的标题覆写），不含进程管理。
