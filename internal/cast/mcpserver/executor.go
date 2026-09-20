@@ -100,6 +100,17 @@ func (e *toolExecutor) Execute(ctx context.Context, tool string, argsJSON json.R
 		out, err := e.s.coreStatus(ctx, in)
 		e.s.record(ctx, tool, in, out, err, start)
 		return marshalOut(out, err)
+	case "cast_resume":
+		// 意图快通道专属（Task 26）：断点续播。与八个 MCP 工具同一 record
+		// 审计路径；不进 MCP 注册表与 brain toolDefs（见 coreResume 注释）。
+		var in deviceIn
+		if err := decodeArgs(tool, argsJSON, &in); err != nil {
+			return "", err
+		}
+		start := time.Now()
+		out, err := e.s.coreResume(ctx, in)
+		e.s.record(ctx, tool, in, out, err, start)
+		return marshalOut(out, err)
 	default:
 		return "", fmt.Errorf("unknown_tool: %s", tool)
 	}

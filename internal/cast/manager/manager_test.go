@@ -408,3 +408,90 @@ func TestDevice_JSONShape(t *testing.T) {
 	assert.NotContains(t, string(b), "state", "空 state 应被 omitempty")
 	assert.Contains(t, string(b), `"online":false`, "online 无 omitempty，恒出现")
 }
+
+// ---- 断点记忆（Task 26：意图快通道的「继续」）----
+
+// TestPauseRecordsBreakpoint_ResumeReplays 断点续播全链：Play（带 url/标题）
+// → Seek 到 90 秒 → Pause 记录断点 → Resume 以同 URL 同位置重新起播（渲染端
+// 收到的拉流地址与位置逐一断言）。
+func TestPauseRecordsBreakpoint_ResumeReplays(t *testing.T) {
+	fake := fakerenderer.New(devTok)
+	defer fake.Close()
+	m := newManager(t, newFakeCfg(fake))
+	ctx := context.Background()
+
+	const media = "http://192.168.1.10:7810/media/santi.mp4"
+	_, err := m.Play(ctx, devName, adapter.PlayRequest{URL: media, Title: "三体"})
+	require.NoError(t, err)
+	_, err = m.Seek(ctx, devName, 90000)
+	require.NoError(t, err)
+	_, err = m.Pause(ctx, devName)
+	require.NoError(t, err)
+
+	st, err := m.Resume(ctx, devName)
+	require.NoError(t, err)
+	assert.Equal(t, "playing", st.State)
+	assert.Equal(t, media, fake.PlayedURL(), "Resume 应以断点同 URL 重新起播")
+
+	got, err := m.Status(ctx, devName)
+	require.NoError(t, err)
+	assert.Equal(t, int64(90000), got.PositionMS, "Resume 应从断点位置起播")
+	assert.Equal(t, "三体", got.Title, "Resume 应带上断点标题")
+}
+
+// TestResumeWithoutBreakpoint 无断点（从未 Pause 过）→ 报 no_last_played，
+// 且不发任何网络请求（渲染端关闭也不影响错误类型）。
+func TestResumeWithoutBreakpoint(t *testing.T) {
+	fake := fakerenderer.New(devTok)
+	defer fake.Close()
+	m := newManager(t, newFakeCfg(fake))
+
+	_, err := m.Resume(context.Background(), devName)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no_last_played")
+}
+
+// TestResumeUnknownDevice 未知设备 → 既有 unknown_device 契约优先。
+func TestResumeUnknownDevice(t *testing.T) {
+	fake := fakerenderer.New(devTok)
+	defer fake.Close()
+	m := newManager(t, newFakeCfg(fake))
+
+	_, err := m.Resume(context.Background(), "no-such")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown_device")
+}
+
+// TestPauseWithoutPlayMemo 不记无源断点：渲染端在播但本进程没有 Play 入参
+// 记忆（如 agent 重启后接手）时，Pause 拿不到 url → 不记断点，Resume 报
+// no_last_played（诚实拒绝优于瞎猜 url）。
+func TestPauseWithoutPlayMemo(t *testing.T) {
+	fake := fakerenderer.New(devTok)
+	defer fake.Close()
+	fake.SetPlaying("http://192.168.1.10:7810/media/x.mp4", "旧会话的片子", 60000)
+	m := newManager(t, newFakeCfg(fake))
+	ctx := context.Background()
+
+	_, err := m.Pause(ctx, devName)
+	require.NoError(t, err)
+	_, err = m.Resume(ctx, devName)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no_last_played")
+}
+
+// TestResumeOffline 断点在但设备失联 → 既有 device_offline 契约。
+func TestResumeOffline(t *testing.T) {
+	fake := fakerenderer.New(devTok)
+	m := newManager(t, newFakeCfg(fake))
+	ctx := context.Background()
+
+	_, err := m.Play(ctx, devName, adapter.PlayRequest{URL: "http://m/a.mp4", Title: "a"})
+	require.NoError(t, err)
+	_, err = m.Pause(ctx, devName)
+	require.NoError(t, err)
+
+	fake.Close() // 断点已记，随后设备离线
+	_, err = m.Resume(ctx, devName)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "device_offline")
+}

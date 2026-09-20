@@ -76,7 +76,7 @@ func newHarness(t *testing.T, resps ...fakellm.Resp) *harness {
 		APIKey:   "sk-webchat",
 		Model:    "glm-4.7",
 		BaseURL:  llm.URL,
-	}, srv.Executor(), nil)
+	}, srv.Executor(), nil, nil) // router=nil：webchat 测试只关心 LLM 路径
 
 	// 与 main.go 相同的路由挂载方式（Go 1.22+ 方法 + 路径模式）。
 	mux := http.NewServeMux()

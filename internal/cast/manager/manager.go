@@ -46,6 +46,22 @@ type dev struct {
 	Token string
 }
 
+// playMemo 记录最近一次成功 Play 的入参（url + 标题）：Pause 记断点时
+// 唯一的 url 来源（协议 GET /status 不含 url，播放入参不留底就无处可取）。
+type playMemo struct {
+	URL   string
+	Title string
+}
+
+// LastPlayed 是一台设备的播放断点（Resume 据此同 URL 同位置重新起播）。
+// 内存态：进程重启即丢失，Resume 对无断点设备报 no_last_played——家庭
+// 单用户场景可接受，持久化留待真实需求出现再做。
+type LastPlayed struct {
+	URL        string
+	Title      string
+	PositionMS int64
+}
+
 // Manager 是设备注册表与播放操作的入口。lib/res 供后续任务扩展
 // （如按 media_id 播放的辅助方法），当前操作直接消费已解析的 PlayRequest。
 type Manager struct {
@@ -56,17 +72,24 @@ type Manager struct {
 
 	mu   sync.Mutex
 	devs map[string]dev
+
+	// 断点记忆的两组内存态（均为设备名 → 记录）：played 是最近一次 Play
+	// 入参留底，lastPlayed 是 Pause 时合成的可续播断点。
+	played     map[string]playMemo
+	lastPlayed map[string]LastPlayed
 }
 
 // New 构造 Manager：注册表以配置播种（静态条目即刻可寻址，无需等待发现），
 // 协议客户端使用默认 HTTP 传输。
 func New(cfg config.Config, lib *resolve.Library, res *resolve.Resolver) *Manager {
 	m := &Manager{
-		cfg:    cfg,
-		client: latticecast.NewClient(nil),
-		lib:    lib,
-		res:    res,
-		devs:   make(map[string]dev, len(cfg.Renderers)),
+		cfg:        cfg,
+		client:     latticecast.NewClient(nil),
+		lib:        lib,
+		res:        res,
+		devs:       make(map[string]dev, len(cfg.Renderers)),
+		played:     make(map[string]playMemo),
+		lastPlayed: make(map[string]LastPlayed),
 	}
 	for name, r := range cfg.Renderers {
 		m.devs[name] = dev{Room: r.Room, Host: r.Host, Port: r.Port, Token: r.Token}
@@ -131,6 +154,8 @@ func (m *Manager) List(ctx context.Context) ([]Device, error) {
 
 // Play 向指定设备下发播放。未知设备报 unknown_device；
 // 网络失败包 device_offline 前缀（底层 *url.Error 仍可 errors.As 解包）。
+// 成功后留底播放入参（url/标题），供 Pause 记断点（url 在协议 status 里
+// 读不到，只能从播放入参来）。
 func (m *Manager) Play(ctx context.Context, name string, r adapter.PlayRequest) (adapter.Status, error) {
 	t, err := m.target(name)
 	if err != nil {
@@ -140,6 +165,9 @@ func (m *Manager) Play(ctx context.Context, name string, r adapter.PlayRequest) 
 	if err != nil {
 		return adapter.Status{}, offline(err)
 	}
+	m.mu.Lock()
+	m.played[name] = playMemo{URL: r.URL, Title: r.Title}
+	m.mu.Unlock()
 	return st, nil
 }
 
@@ -156,13 +184,48 @@ func (m *Manager) Stop(ctx context.Context, name string) (adapter.Status, error)
 	return st, nil
 }
 
-// Pause 暂停指定设备播放（渲染端幂等：已在 paused 时原样回执）。
+// Pause 暂停指定设备播放（渲染端幂等：已在 paused 时原样回执）。暂停成功
+// 后记断点 {url, 标题, 位置}：位置取暂停后的 status（渲染端冻结在暂停点），
+// url/标题取最近一次 Play 留底——无留底（如 agent 重启后接手的播放）拿不到
+// url，不记断点（诚实拒绝优于瞎猜）。status 拿不到不致命：仅该次断点缺失。
 func (m *Manager) Pause(ctx context.Context, name string) (adapter.Status, error) {
 	t, err := m.target(name)
 	if err != nil {
 		return adapter.Status{}, err
 	}
 	st, err := m.client.Pause(ctx, t)
+	if err != nil {
+		return adapter.Status{}, offline(err)
+	}
+	if s2, serr := m.client.Status(ctx, t); serr == nil {
+		m.mu.Lock()
+		if memo, ok := m.played[name]; ok {
+			title := memo.Title
+			if title == "" {
+				title = s2.Title
+			}
+			m.lastPlayed[name] = LastPlayed{URL: memo.URL, Title: title, PositionMS: s2.PositionMS}
+		}
+		m.mu.Unlock()
+	}
+	return st, nil
+}
+
+// Resume 按断点记忆续播：同 URL 同位置重新起播（标题原样带上）。无断点
+// （从未 Pause 过或进程重启丢失）报 no_last_played；设备寻址与网络失败
+// 语义与 Play 完全一致（unknown_device / device_offline）。
+func (m *Manager) Resume(ctx context.Context, name string) (adapter.Status, error) {
+	t, err := m.target(name)
+	if err != nil {
+		return adapter.Status{}, err
+	}
+	m.mu.Lock()
+	lp, ok := m.lastPlayed[name]
+	m.mu.Unlock()
+	if !ok {
+		return adapter.Status{}, fmt.Errorf("no_last_played: %s", name)
+	}
+	st, err := m.client.Play(ctx, t, adapter.PlayRequest{URL: lp.URL, Title: lp.Title, PositionMS: lp.PositionMS})
 	if err != nil {
 		return adapter.Status{}, offline(err)
 	}

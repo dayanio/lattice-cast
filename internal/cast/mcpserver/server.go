@@ -236,6 +236,15 @@ func (s *Server) coreStatus(ctx context.Context, in deviceIn) (statusOut, error)
 	return statusOut{Status: st}, err
 }
 
+// coreResume 是 cast_resume 的执行核心：按 Manager 断点记忆续播（同 URL
+// 同位置重新起播）。仅供内置大脑的意图快通道（internal/cast/intent）经
+// Executor() 直调——刻意不进 MCP 注册表、不在 brain 的 toolDefs 里：
+// LLM 看不到该工具名，续播是本地规则引擎的专属能力。
+func (s *Server) coreResume(ctx context.Context, in deviceIn) (playOut, error) {
+	st, err := s.mgr.Resume(ctx, in.Device)
+	return playOut{Status: st, Adapter: "latticecast"}, err
+}
+
 // ---- 八个工具 handler（薄壳：执行核心 + 审计）----
 
 func (s *Server) listDevices(ctx context.Context, _ *mcp.CallToolRequest, _ listIn) (*mcp.CallToolResult, []manager.Device, error) {

@@ -597,3 +597,66 @@ func TestAuditGrowsWithEveryCall(t *testing.T) {
 		assert.GreaterOrEqual(t, e.DurationMS, int64(0))
 	}
 }
+
+// ---- 意图快通道内部工具：cast_resume（Executor 直调面，不在 MCP 注册表）----
+
+// TestExecutor_CastResume 断点续播经执行核心适配器（Task 26 意图快通道的
+// 专属工具）：无断点 → no_last_played 契约错误；Play → Seek → Pause 记断点
+// 后 cast_resume 以同 URL 同位置续播；失败与成功都落审计（与八个 MCP 工具
+// 同一 JSONL）。
+func TestExecutor_CastResume(t *testing.T) {
+	fake := fakerenderer.New(renderTok)
+	t.Cleanup(fake.Close)
+	tgt := fake.Target()
+
+	cfg := config.Config{
+		AuthToken:    mcpToken,
+		MediaBaseURL: "http://192.168.1.10:7810",
+		Renderers: map[string]config.Renderer{
+			devName: {Room: devRoom, Host: tgt.Host, Port: tgt.Port, Token: renderTok},
+		},
+	}
+	lib := resolve.NewLibrary(nil)
+	res := &resolve.Resolver{Lib: lib, Base: cfg.MediaBaseURL}
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	audit, err := manager.OpenAudit(auditPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = audit.Close() })
+
+	mgr := manager.New(cfg, lib, res)
+	srv := New(mgr, lib, res, audit, StaticToken(cfg.AuthToken))
+	exec := srv.Executor()
+	ctx := context.Background()
+	resumeArgs := json.RawMessage(`{"device":"` + devName + `"}`)
+
+	// 无断点 → 契约错误（且已落审计）。
+	_, err = exec.Execute(ctx, "cast_resume", resumeArgs)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no_last_played")
+
+	// 记断点：Play → Seek 到 90 秒 → Pause。
+	const media = "http://192.168.1.10:7810/media/santi.mp4"
+	_, err = mgr.Play(ctx, devName, adapter.PlayRequest{URL: media, Title: "三体"})
+	require.NoError(t, err)
+	_, err = mgr.Seek(ctx, devName, 90000)
+	require.NoError(t, err)
+	_, err = mgr.Pause(ctx, devName)
+	require.NoError(t, err)
+
+	// 续播：同 URL 同位置。
+	out, err := exec.Execute(ctx, "cast_resume", resumeArgs)
+	require.NoError(t, err)
+	var po playOut
+	require.NoError(t, json.Unmarshal([]byte(out), &po))
+	assert.Equal(t, "playing", po.Status.State)
+	assert.Equal(t, "latticecast", po.Adapter)
+	assert.Equal(t, media, fake.PlayedURL(), "cast_resume 应以断点同 URL 重新起播")
+	st, err := mgr.Status(ctx, devName)
+	require.NoError(t, err)
+	assert.Equal(t, int64(90000), st.PositionMS, "cast_resume 应从断点位置起播")
+
+	// 审计：失败 + 成功各一行。
+	raw, err := os.ReadFile(auditPath)
+	require.NoError(t, err)
+	assert.Equal(t, 2, strings.Count(string(raw), `"cast_resume"`), "cast_resume 的失败与成功都应落审计")
+}

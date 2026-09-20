@@ -3,6 +3,10 @@
 // 相同的工具调用——经 ToolExecutor 内部直调 mcpserver 的执行核心，不走
 // HTTP 自环，审计同路径落行。
 //
+// 意图快通道（v2.1，可选）：New 可挂载 internal/cast/intent 的本地规则引擎，
+// 高频中文指令（暂停/继续/快进/音量/状态/投片）命中即本地直执（毫秒级，
+// 不调 LLM），未命中原样落回本包的 LLM 工具循环（零损失）。
+//
 // 线路协议：三家 provider（glm|claude|ollama）统一走 OpenAI 兼容的 chat
 // completions；stream=false（v1 简化：整段补全一次性返回，SSE 帧由 webchat
 // 层包装）。api_key 只存在于服务端（以 Bearer 头下发），一切错误文本经
@@ -27,6 +31,7 @@ import (
 	"time"
 
 	"github.com/dayanio/lattice-cast/internal/cast/config"
+	"github.com/dayanio/lattice-cast/internal/cast/intent"
 )
 
 // ToolExecutor 是工具执行核心的抽象：由 mcpserver 提供适配器（Go 结构化
@@ -37,7 +42,8 @@ type ToolExecutor interface {
 	Execute(ctx context.Context, tool string, argsJSON json.RawMessage) (result string, err error)
 }
 
-// ChatEvent 是一次聊天回复的事件流。Type 取值：
+// ChatEvent 是一次聊天回复的事件流（intent.ChatEvent 的类型别名：意图快
+// 通道与 LLM 工具循环共用同一事件类型，webchat/SSE 层零改动）。Type 取值：
 //   - "delta"：助手伴随工具调用的过程文本（v1 整段一条）；
 //   - "tool"：一个工具开始执行（Text 为工具名）；
 //   - "final"：最终答复（Text 为完整答复文本，本轮结束）；
@@ -46,10 +52,7 @@ type ToolExecutor interface {
 // error 是 delta|tool|final 之外的第四种类型：工具循环跑在后台 goroutine，
 // Chat 同步返回之后发生的失败（LLM 不可达/鉴权失败/循环超限）只能经通道
 // 送达，SSE 层原样转发。
-type ChatEvent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
+type ChatEvent = intent.ChatEvent
 
 const (
 	// maxToolIterations 单次回复允许的工具轮数上限：防失控循环。
@@ -100,10 +103,11 @@ type session struct {
 	msgs []message
 }
 
-// Brain 是内置大脑：LLM 工具循环 + 多轮会话。
+// Brain 是内置大脑：意图快通道（可选）+ LLM 工具循环 + 多轮会话。
 type Brain struct {
 	cfg      config.Brain
 	exec     ToolExecutor
+	router   *intent.Router // 意图快通道；nil = 不启用（纯 LLM 路径）
 	hc       *http.Client
 	endpoint string // chat completions 完整地址（base_url 归一化后拼接）
 
@@ -112,14 +116,16 @@ type Brain struct {
 }
 
 // New 构造 Brain。hc 为 nil 时使用 60 秒超时的默认客户端（整段补全的合理
-// 上限）；cfg.BaseURL 由 config.Load 按 provider 填好预设端点。
-func New(cfg config.Brain, exec ToolExecutor, hc *http.Client) *Brain {
+// 上限）；cfg.BaseURL 由 config.Load 按 provider 填好预设端点。router 为
+// 意图快通道（internal/cast/intent），nil = 不启用（行为与 v1 完全一致）。
+func New(cfg config.Brain, exec ToolExecutor, hc *http.Client, router *intent.Router) *Brain {
 	if hc == nil {
 		hc = &http.Client{Timeout: 60 * time.Second}
 	}
 	return &Brain{
 		cfg:      cfg,
 		exec:     exec,
+		router:   router,
 		hc:       hc,
 		endpoint: strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions",
 		sessions: make(map[string]*session),
@@ -129,12 +135,30 @@ func New(cfg config.Brain, exec ToolExecutor, hc *http.Client) *Brain {
 // Chat 追加一轮用户输入并异步驱动工具循环；返回的事件通道在循环结束时
 // （final 或 error）关闭。sessionID 首次出现时创建会话并注入系统提示
 // （含当前设备清单），多轮历史随后保留。
+//
+// 意图快通道（router 非 nil 时）：先经本地规则引擎裁决，命中即直执工具并
+// 把事件同步回放为通道（不调 LLM，毫秒级返回）；未命中原样走下方 LLM 路径。
+// 快通道轮次不写入会话历史——规则引擎自足且不消费历史，而为其补建会话
+// （systemPrompt 需探测全部设备）会给快路径引入渲染端探测延迟；代价是
+// LLM 看不到快通道轮次（后续话语引用「刚才放的片子」时缺失上下文），
+// v2.1 接受该取舍。
 func (b *Brain) Chat(ctx context.Context, sessionID, userText string) (<-chan ChatEvent, error) {
 	if userText == "" {
 		return nil, errors.New("brain: empty_message")
 	}
 	if b.exec == nil {
 		return nil, errors.New("brain: tool executor is nil")
+	}
+
+	if b.router != nil {
+		if handled, events := b.router.TryHandle(ctx, userText); handled {
+			ch := make(chan ChatEvent, len(events))
+			for _, ev := range events {
+				ch <- ev
+			}
+			close(ch)
+			return ch, nil
+		}
 	}
 
 	b.mu.Lock()

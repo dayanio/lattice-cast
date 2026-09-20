@@ -26,6 +26,7 @@ import (
 
 	"github.com/dayanio/lattice-cast/internal/cast/brain"
 	"github.com/dayanio/lattice-cast/internal/cast/config"
+	"github.com/dayanio/lattice-cast/internal/cast/intent"
 	"github.com/dayanio/lattice-cast/internal/cast/manager"
 	"github.com/dayanio/lattice-cast/internal/cast/mcpserver"
 	"github.com/dayanio/lattice-cast/internal/cast/resolve"
@@ -110,13 +111,23 @@ func run(configPath string) error {
 	mgr := manager.New(cfg, lib, res)
 	srv := mcpserver.New(mgr, lib, res, audit, mcpserver.StaticToken(cfg.AuthToken))
 
+	// 编译期钉住：执行核心适配器同时满足 LLM 循环与意图快通道的工具接口。
+	var _ brain.ToolExecutor = srv.Executor()
+	var _ intent.ToolExecutor = srv.Executor()
+
 	// 内置大脑 + 网页聊天（可选，v1.1）：仅在配置了 brain.provider 时装配。
 	// 工具执行经 mcpserver.Executor 直调同一执行核心（内部调用，不走 HTTP
 	// 自环），/chat 路由与 MCP 共用监听与 Bearer 令牌；未启用时 handler
 	// 保持原样（零 brain 路径与既有行为逐字节一致）。
 	var handler http.Handler = srv.HTTP()
 	if cfg.Brain.Provider != "" {
-		br := brain.New(cfg.Brain, srv.Executor(), nil)
+		// 意图快通道（v2.1）：房间名 → 设备名映射来自配置渲染端，规则命中
+		// 直执（毫秒级），未命中落回 LLM 工具循环。
+		rooms := make(map[string]string, len(cfg.Renderers))
+		for name, r := range cfg.Renderers {
+			rooms[r.Room] = name
+		}
+		br := brain.New(cfg.Brain, srv.Executor(), nil, intent.New(rooms, srv.Executor()))
 		wc := webchat.New(br, mcpserver.StaticToken(cfg.AuthToken))
 		mux := http.NewServeMux()
 		mux.HandleFunc("GET /chat", wc.Page)

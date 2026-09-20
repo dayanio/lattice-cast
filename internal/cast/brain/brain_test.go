@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dayanio/lattice-cast/internal/cast/config"
+	"github.com/dayanio/lattice-cast/internal/cast/intent"
 	"github.com/dayanio/lattice-cast/internal/cast/manager"
 	"github.com/dayanio/lattice-cast/internal/cast/mcpserver"
 	"github.com/dayanio/lattice-cast/internal/cast/resolve"
@@ -48,6 +49,13 @@ type stack struct {
 
 // newStack 构造被测栈；wrap 可选地装饰执行核心（如并发测试的门控执行器）。
 func newStack(t *testing.T, wrap ...func(ToolExecutor) ToolExecutor) *stack {
+	return newStackRouter(t, nil, wrap...)
+}
+
+// newStackRouter 同 newStack，但允许挂载意图快通道（nil = 纯 LLM 路径，
+// v1 行为）。既有 LLM 循环测试全部走 newStack（router=nil，行为不变），
+// 快通道测试走 newStackRouter。
+func newStackRouter(t *testing.T, rooms map[string]string, wrap ...func(ToolExecutor) ToolExecutor) *stack {
 	t.Helper()
 
 	fake := fakerenderer.New(renderTok)
@@ -81,12 +89,17 @@ func newStack(t *testing.T, wrap ...func(ToolExecutor) ToolExecutor) *stack {
 	}
 
 	llm := fakellm.New()
+	// rooms 为 nil = 不启用快通道（纯 LLM 路径，v1 行为）；非 nil = 挂载。
+	var router *intent.Router
+	if rooms != nil {
+		router = intent.New(rooms, exec)
+	}
 	br := New(config.Brain{
 		Provider: "glm",
 		APIKey:   brainKey,
 		Model:    "glm-4.7",
 		BaseURL:  llm.URL,
-	}, exec, nil)
+	}, exec, nil, router)
 
 	return &stack{brain: br, llm: llm, fake: fake, lib: lib, auditPath: auditPath}
 }
@@ -468,4 +481,66 @@ func TestChat_ConcurrentSameSession(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, tools, "第一轮应恰执行一次 cast_play：%v", got1)
+}
+
+// ---- 意图快通道（Task 26）：router 命中不调 LLM，未命中原样落回 ----
+
+// 编译期钉住：brain.ChatEvent 是 intent.ChatEvent 的类型别名（同一类型，
+// webchat/SSE 零改动）。
+var _ ChatEvent = intent.ChatEvent{}
+
+// TestChat_FastPathHandlesWithoutLLM 挂载 router 后，「暂停」经快通道直执
+// （事件流含 tool + final），Fake LLM 零请求——高频指令不再付 10~20s 的
+// LLM 轮次。
+func TestChat_FastPathHandlesWithoutLLM(t *testing.T) {
+	s := newStackRouter(t, map[string]string{devRoom: devName})
+
+	events, err := s.brain.Chat(context.Background(), "s1", "暂停")
+	require.NoError(t, err)
+
+	var types []string
+	for ev := range events {
+		types = append(types, ev.Type)
+	}
+	assert.Contains(t, types, "tool")
+	assert.Contains(t, types, "final")
+	assert.Empty(t, s.llm.Requests(), "快通道命中后不得调 LLM")
+}
+
+// TestChat_FastPathFallsThroughToLLM 规则外话语（「你好」）原样走 LLM
+// 工具循环，事件流与纯 LLM 路径一致（快通道零损失）。
+func TestChat_FastPathFallsThroughToLLM(t *testing.T) {
+	s := newStackRouter(t, map[string]string{devRoom: devName})
+	s.llm.Script(fakellm.Resp{Body: textBody("你好！我能帮你投屏。")})
+
+	events, err := s.brain.Chat(context.Background(), "s1", "你好")
+	require.NoError(t, err)
+
+	var final string
+	for ev := range events {
+		if ev.Type == "final" {
+			final = ev.Text
+		}
+	}
+	assert.Equal(t, "你好！我能帮你投屏。", final)
+	require.Len(t, s.llm.Requests(), 1, "未命中应恰好调一次 LLM")
+}
+
+// TestChat_NilRouterKeepsV1Behavior router 为 nil（不启用）时 LLM 路径
+// 完全不变——「暂停」也由 LLM 处理（向后兼容口径）。
+func TestChat_NilRouterKeepsV1Behavior(t *testing.T) {
+	s := newStack(t) // router = nil
+	s.llm.Script(fakellm.Resp{Body: textBody("好的，已暂停。")})
+
+	events, err := s.brain.Chat(context.Background(), "s1", "暂停")
+	require.NoError(t, err)
+
+	var final string
+	for ev := range events {
+		if ev.Type == "final" {
+			final = ev.Text
+		}
+	}
+	assert.Equal(t, "好的，已暂停。", final)
+	require.Len(t, s.llm.Requests(), 1)
 }
