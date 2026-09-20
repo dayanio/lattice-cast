@@ -275,19 +275,35 @@ func (b *Brain) complete(ctx context.Context, msgs []message) (message, error) {
 func (b *Brain) systemPrompt(ctx context.Context) string {
 	devices := "（设备清单暂时不可用，请先调用 list_cast_devices 查询）"
 	if res, err := b.exec.Execute(ctx, "list_cast_devices", json.RawMessage("{}")); err == nil && res != "" {
-		devices = res
+		// 紧凑化：只保留 在线设备的 name(room) 行，减少每轮输入 token
+		var parsed []struct {
+			Name   string `json:"name"`
+			Room   string `json:"room"`
+			Online bool   `json:"online"`
+		}
+		if json.Unmarshal([]byte(res), &parsed) == nil && len(parsed) > 0 {
+			var lines []string
+			for _, d := range parsed {
+				if d.Online {
+					lines = append(lines, d.Name+"（"+d.Room+"）")
+				}
+			}
+			if len(lines) > 0 {
+				devices = strings.Join(lines, "、")
+			}
+		}
 	}
 	var sb strings.Builder
 	sb.WriteString("你是 LatticeCast 投屏助手：帮用户把 NAS / reflux / 网络媒体投放到家中的投屏设备上播放。\n\n")
-	sb.WriteString("当前设备清单（JSON；状态可能变化，拿不准时先调 list_cast_devices 刷新）：\n")
+	sb.WriteString("当前在线设备：")
 	sb.WriteString(devices)
-	sb.WriteString("\n\n使用规则：\n")
+	sb.WriteString("\n\n规则：\n")
 	sb.WriteString("1. 始终用中文回复。\n")
-	sb.WriteString("2. 用户请求有歧义时必须先反问确认（如命中多个设备或多个媒体），不要替用户擅自选择。\n")
-	sb.WriteString("3. 按 media_id 播放前先用 search_media 检索，把结果里的 media_id 原样传给 cast_play，不要杜撰。\n")
-	sb.WriteString("4. 工具失败时用中文向用户解释原因（错误文本是英文契约词，转述即可，不要原样粘贴）。\n")
-	sb.WriteString("5. search_media 没有命中时，可先换 1~2 个替代关键词重试（如英文原名、别名、去掉副标题的核心词，例：《看见恶魔》→ \"devil\"）；仍无结果才如实告知用户\"没有找到\"。严禁编造文件路径、文件名或 URL 去 cast_play。\n")
-	sb.WriteString("6. cast_play 的 url 参数只接受 http(s):// 开头的真实网络直链；本地路径（如 /Volumes/…、/Users/…）一律禁止——本地文件只通过 search_media 返回的 media_id 播放。")
+	sb.WriteString("2. 有歧义先反问，不擅自选择。\n")
+	sb.WriteString("3. 先 search_media 检索，把结果的 media_id 原样传给 cast_play，不杜撰。\n")
+	sb.WriteString("4. 工具失败时用中文解释原因，不原样粘贴错误。\n")
+	sb.WriteString("5. 搜索未命中可换 1~2 个替代关键词重试（英文原名/别名/核心短词，例：《看见恶魔》→\"devil\"）；仍无结果才如实说\"没有找到\"。严禁编造路径或 URL。\n")
+	sb.WriteString("6. cast_play 的 url 只接受 http(s):// 直链；本地路径禁止——本地文件只用 media_id。")
 	return sb.String()
 }
 
