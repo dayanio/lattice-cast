@@ -136,6 +136,13 @@ func (m *Manager) List(ctx context.Context) ([]Device, error) {
 	for _, name := range names {
 		d := snapshot[name]
 		device := Device{Name: name, Room: d.Room}
+		if d.Host == "" {
+			// 尚未寻址到（仅 mDNS 配置、还没被发现过）：与 target() 同一判据，
+			// 直接判离线，不构造 http://:0 这样的畸形请求（其响应形状取决于
+			// 本机网络环境——见 target() 注释）。
+			devices = append(devices, device)
+			continue
+		}
 		if st, err := m.client.Status(ctx, adapter.Target{Host: d.Host, Port: d.Port, Token: d.Token}); err == nil {
 			device.Online = true
 			device.State = st.State
@@ -275,13 +282,20 @@ func (m *Manager) Status(ctx context.Context, name string) (adapter.Status, erro
 	return st, nil
 }
 
-// target 按设备名取当前寻址信息；未知设备报 unknown_device。
+// target 按设备名取当前寻址信息；未知设备报 unknown_device，尚未寻址到
+// （仅 mDNS 配置、Refresh 还没发现过）的设备直接报 device_offline——不构造
+// http://:0 这样的畸形请求去试探网络：拿到的响应形状取决于本机网络环境
+// （有全局代理/VPN 的机器上，对不存在地址的请求可能被代答成 502 而非连接
+// 失败，导致 netUnreachable() 误判为非离线错误）。
 func (m *Manager) target(name string) (adapter.Target, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d, ok := m.devs[name]
 	if !ok {
 		return adapter.Target{}, fmt.Errorf("unknown_device: %s", name)
+	}
+	if d.Host == "" {
+		return adapter.Target{}, fmt.Errorf("device_offline: %s not yet discovered", name)
 	}
 	return adapter.Target{Host: d.Host, Port: d.Port, Token: d.Token}, nil
 }

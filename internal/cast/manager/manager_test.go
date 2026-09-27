@@ -115,6 +115,32 @@ func TestList_AnsweringButErroring(t *testing.T) {
 	assert.Empty(t, got.NowPlaying, "异常时 now_playing 须为空")
 }
 
+// TestList_UnaddressedDevice 配置条目无 host（仅 mDNS，尚未被 Refresh 发现过）：
+// 与 TestOps_UnaddressedDevice 同一场景搬到 List 上——真实运行中曾经在这条
+// 路径上把这类设备错报成 online=true + state="error"（List 内联构造
+// Target{}，未经 target() 的判据），因为 List 自己算地址、没有复用 target()
+// 的检查。
+func TestList_UnaddressedDevice(t *testing.T) {
+	cfg := config.Config{
+		AuthToken:    "tok-mcp",
+		MediaBaseURL: "http://192.168.1.10:7810",
+		Renderers: map[string]config.Renderer{
+			devName: {Room: devRoom, Token: devTok}, // 无 host：仅 mDNS 发现
+		},
+	}
+	m := newManager(t, cfg)
+
+	devices, err := m.List(context.Background())
+	require.NoError(t, err)
+	require.Len(t, devices, 1, "尚未寻址到的设备仍在配置中，不得从清单消失")
+
+	got := devices[0]
+	assert.Equal(t, devName, got.Name)
+	assert.False(t, got.Online, "尚未寻址到应判离线，不是 online=true+state=error")
+	assert.Empty(t, got.State)
+	assert.Empty(t, got.NowPlaying)
+}
+
 // ---- Play / Stop / Status ----
 
 // TestPlay_RoutesToDevice Play 正确路由：Manager 按设备名查当前 host/port/token
