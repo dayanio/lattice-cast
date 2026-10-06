@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/dayanio/lattice-cast/internal/cast/adapter"
 	"github.com/dayanio/lattice-cast/internal/cast/adapter/latticecast"
@@ -112,11 +113,17 @@ func (m *Manager) Refresh(ctx context.Context) {
 	}
 }
 
+// probeBudget 是单台设备的探测超时：并行探测下清单耗时以此封顶，而不是
+// 逐台超时之和（串行时双离线设备要 2×15s，撞外部编排器的单工具预算）。
+const probeBudget = 3 * time.Second
+
 // List 刷新注册表后逐台探测状态：在线设备回填 state/now_playing；网络不可达
 // （或尚未寻址）的设备 Online=false 且两字段为空；渲染端应答了但报错（如
 // token 不符的 401、ok=false）的设备仍在线，标记 State="error"——设备活着，
 // 异常须如实呈现而非误报离线。清单按设备名排序，覆盖配置中全部设备（离线
 // 设备不得从清单消失）。探测失败不视为整体失败。
+// 探测并行下发（每台独立 probeBudget 超时）：离线设备的等待彼此重叠，
+// 离线越多不越慢。
 func (m *Manager) List(ctx context.Context) ([]Device, error) {
 	m.Refresh(ctx)
 
@@ -132,30 +139,36 @@ func (m *Manager) List(ctx context.Context) ([]Device, error) {
 	}
 	m.mu.Unlock()
 
-	devices := make([]Device, 0, len(names))
-	for _, name := range names {
+	devices := make([]Device, len(names))
+	var wg sync.WaitGroup
+	for i, name := range names {
 		d := snapshot[name]
-		device := Device{Name: name, Room: d.Room}
+		devices[i] = Device{Name: name, Room: d.Room}
 		if d.Host == "" {
 			// 尚未寻址到（仅 mDNS 配置、还没被发现过）：与 target() 同一判据，
 			// 直接判离线，不构造 http://:0 这样的畸形请求（其响应形状取决于
 			// 本机网络环境——见 target() 注释）。
-			devices = append(devices, device)
 			continue
 		}
-		if st, err := m.client.Status(ctx, adapter.Target{Host: d.Host, Port: d.Port, Token: d.Token}); err == nil {
-			device.Online = true
-			device.State = st.State
-			device.NowPlaying = st.Title
-		} else if !netUnreachable(err) {
-			// 渲染端应答了但报错（如 token 不符的 401、ok=false）：
-			// 在线但异常 → State="error"，供 LLM 甄别配置问题。
-			device.Online = true
-			device.State = "error"
-		}
-		// 网络不可达（*url.Error）：保持 Online=false 且两字段为空。
-		devices = append(devices, device)
+		wg.Add(1)
+		go func(i int, d dev) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, probeBudget)
+			defer cancel()
+			if st, err := m.client.Status(pctx, adapter.Target{Host: d.Host, Port: d.Port, Token: d.Token}); err == nil {
+				devices[i].Online = true
+				devices[i].State = st.State
+				devices[i].NowPlaying = st.Title
+			} else if !netUnreachable(err) {
+				// 渲染端应答了但报错（如 token 不符的 401、ok=false）：
+				// 在线但异常 → State="error"，供 LLM 甄别配置问题。
+				devices[i].Online = true
+				devices[i].State = "error"
+			}
+			// 网络不可达（*url.Error）：保持 Online=false 且两字段为空。
+		}(i, d)
 	}
+	wg.Wait()
 	return devices, nil
 }
 
