@@ -20,6 +20,7 @@
 package mcpserver
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -201,7 +202,11 @@ func (s *Server) doPlay(ctx context.Context, in playIn) (playOut, error) {
 		return playOut{}, err
 	}
 
-	st, err := s.mgr.Play(ctx, in.Device, adapter.PlayRequest{URL: src.URL, Title: in.Title, PositionMS: in.PositionMS})
+	// 片名：用户显式传的 title 优先，否则用解析出的库内片名——渲染端播放器
+	// 标题栏/协议 status 都取自 PlayRequest，留空会被接收端显示为「未知」。
+	st, err := s.mgr.Play(ctx, in.Device, adapter.PlayRequest{
+		URL: src.URL, Title: cmp.Or(in.Title, src.Title), PositionMS: in.PositionMS,
+	})
 	if err != nil {
 		return playOut{}, err
 	}

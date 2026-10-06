@@ -19,10 +19,12 @@ const (
 )
 
 // Source 是一次解析的结果：URL 为渲染端可直接拉流的地址，Kind 标注来源类别
-// （direct|youtube|nas）。
+// （direct|youtube|nas），Title 是展示用片名（随 PlayRequest 下发给渲染端，
+// 接收端播放器标题栏用；direct/youtube 提流路径没有可靠片名，允许为空）。
 type Source struct {
-	URL  string
-	Kind string
+	URL   string
+	Kind  string
+	Title string
 }
 
 // Extractor 把页面地址解析成直链媒体地址（如 yt-dlp 对 YouTube 页面的提取）。
@@ -86,10 +88,11 @@ func (r *Resolver) ByID(ctx context.Context, id string) (Source, error) {
 		}
 		return Source{URL: u, Kind: KindReflux}, nil
 	}
-	if _, ok := r.Lib.Get(id); !ok {
+	it, ok := r.Lib.Get(id)
+	if !ok {
 		return Source{}, fmt.Errorf("unknown_media_id: %s", id)
 	}
-	return Source{URL: r.Lib.MediaURL(r.Base, id), Kind: KindNAS}, nil
+	return Source{URL: r.Lib.MediaURL(r.Base, id), Kind: KindNAS, Title: it.Title}, nil
 }
 
 // ByURL 按 URL 解析：
