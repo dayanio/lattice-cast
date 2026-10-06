@@ -9,10 +9,14 @@
 //	cast_pause(device) → {"status":…}
 //	cast_seek(device, position_ms) → {"status":…}
 //	cast_volume(device, level 0-100) → {"status":…}
+//	cast_resume(device) → {"status":…,"adapter":"latticecast"}
 //
 // 每次调用（含失败）经 audit.Record 落一行 JSONL，agent 署名取自鉴权层。
 // 工具的执行核心（core* / doPlay）同时供内置大脑（internal/cast/brain）经
 // Executor() 适配器内部直调——与 MCP handler 完全同一份实现与审计路径。
+// cast_resume 原为内置大脑 intent 快通道专属（刻意不进 MCP 注册表）；
+// lattice-copilot 成为编排入口后，断点续播只有 Manager 记得，LLM 侧
+// 无从重投，故注册暴露（直调路径不受影响）。
 package mcpserver
 
 import (
@@ -119,6 +123,9 @@ func New(mgr *manager.Manager, lib *resolve.Library, res *resolve.Resolver, audi
 	mcp.AddTool[deviceIn, statusOut](srv,
 		&mcp.Tool{Name: "cast_status", Description: "Get a device's current playback state."},
 		s.status)
+	mcp.AddTool[deviceIn, playOut](srv,
+		&mcp.Tool{Name: "cast_resume", Description: "Resume playback on a device from the remembered breakpoint (same media, same position); fails if nothing was played in this agent's lifetime."},
+		s.resume)
 	s.mcp = srv
 	return s
 }
@@ -300,5 +307,12 @@ func (s *Server) status(ctx context.Context, _ *mcp.CallToolRequest, in deviceIn
 	start := time.Now()
 	out, err := s.coreStatus(ctx, in)
 	s.record(ctx, "cast_status", in, out, err, start)
+	return nil, out, err
+}
+
+func (s *Server) resume(ctx context.Context, _ *mcp.CallToolRequest, in deviceIn) (*mcp.CallToolResult, playOut, error) {
+	start := time.Now()
+	out, err := s.coreResume(ctx, in)
+	s.record(ctx, "cast_resume", in, out, err, start)
 	return nil, out, err
 }
