@@ -1,0 +1,93 @@
+
+=== cast_play 到 study-mpv（新片） ===
+cast_play({"device":"study-mpv","media_id":"eb66c32b40f5"})
+  isError=false
+  text: {"adapter":"latticecast","status":{"duration_ms":0,"error":"","position_ms":0,"state":"playing","title":""}}
+  structured: {"adapter":"latticecast","status":{"duration_ms":0,"error":"","position_ms":0,"state":"playing","title":""}}
+
+=== cast_status（应播放中，~3s） ===
+cast_status({"device":"study-mpv"})
+  isError=false
+  text: {"status":{"duration_ms":300000,"error":"","position_ms":3067,"state":"playing","title":""}}
+  structured: {"status":{"duration_ms":300000,"error":"","position_ms":3067,"state":"playing","title":""}}
+
+=== cast_pause ===
+cast_pause({"device":"study-mpv"})
+  isError=false
+  text: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"paused","title":""}}
+  structured: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"paused","title":""}}
+
+=== cast_status（暂停后，位置应≈刚才、state=paused） ===
+cast_status({"device":"study-mpv"})
+  isError=false
+  text: {"status":{"duration_ms":300000,"error":"","position_ms":3067,"state":"paused","title":""}}
+  structured: {"status":{"duration_ms":300000,"error":"","position_ms":3067,"state":"paused","title":""}}
+
+=== cast_seek 到 60000ms ===
+cast_seek({"device":"study-mpv","position_ms":60000})
+  isError=false
+  text: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"paused","title":""}}
+  structured: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"paused","title":""}}
+
+=== cast_status（跳转后应≈60000ms） ===
+cast_status({"device":"study-mpv"})
+  isError=false
+  text: {"status":{"duration_ms":300000,"error":"","position_ms":60000,"state":"paused","title":""}}
+  structured: {"status":{"duration_ms":300000,"error":"","position_ms":60000,"state":"paused","title":""}}
+
+=== cast_play 续播（同设备，无 media_id/url，带 position_ms 恢复） ===
+cast_play({"device":"study-mpv","media_id":"eb66c32b40f5","position_ms":60000})
+  isError=false
+  text: {"adapter":"latticecast","status":{"duration_ms":0,"error":"","position_ms":0,"state":"playing","title":""}}
+  structured: {"adapter":"latticecast","status":{"duration_ms":0,"error":"","position_ms":0,"state":"playing","title":""}}
+
+=== cast_status（恢复播放，位置应继续前进） ===
+cast_status({"device":"study-mpv"})
+  isError=false
+  text: {"status":{"duration_ms":300000,"error":"","position_ms":63067,"state":"playing","title":""}}
+  structured: {"status":{"duration_ms":300000,"error":"","position_ms":63067,"state":"playing","title":""}}
+
+=== cast_volume 设为 40 ===
+cast_volume({"device":"study-mpv","level":40})
+  isError=false
+  text: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"playing","title":""}}
+  structured: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"playing","title":""}}
+
+=== cast_stop ===
+cast_stop({"device":"study-mpv"})
+  isError=false
+  text: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"idle","title":""}}
+  structured: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"idle","title":""}}
+
+=== cast_status（停止后） ===
+cast_status({"device":"study-mpv"})
+  isError=false
+  text: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"idle","title":""}}
+  structured: {"status":{"duration_ms":0,"error":"","position_ms":0,"state":"idle","title":""}}
+
+=== list_cast_devices（停止后） ===
+list_cast_devices({})
+  isError=false
+  text: [{"name":"bedroom-tv","room":"卧室","online":false},{"name":"study-mpv","room":"书房","online":true,"state":"idle"}]
+  structured: [{"name":"bedroom-tv","online":false,"room":"卧室"},{"name":"study-mpv","online":true,"room":"书房","state":"idle"}]
+
+=== 反例1：投到从未上线的设备（bedroom-tv，应报不在线） ===
+cast_play({"device":"bedroom-tv","media_id":"eb66c32b40f5"})
+  isError=true
+  text: device_offline: bedroom-tv not yet discovered
+
+=== 反例2：投到不存在的设备名 ===
+cast_play({"device":"living-room-does-not-exist","media_id":"eb66c32b40f5"})
+  isError=true
+  text: unknown_device: living-room-does-not-exist
+
+=== 反例3：投一个渲染端够不着的地址（模拟'笔记本本地文件'） ===
+cast_play({"device":"study-mpv","url":"http://127.0.0.1:1/nope.mp4"})
+  isError=true
+  text: mpv returned to idle without playback: source unplayable
+
+=== 反例3 后续状态（应体现出错，不是静默成功） ===
+cast_status({"device":"study-mpv"})
+  isError=false
+  text: {"status":{"duration_ms":0,"error":"mpv returned to idle without playback: source unplayable","position_ms":0,"state":"error","title":""}}
+  structured: {"status":{"duration_ms":0,"error":"mpv returned to idle without playback: source unplayable","position_ms":0,"state":"error","title":""}}

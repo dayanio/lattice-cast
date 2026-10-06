@@ -6,6 +6,11 @@ options:
   deploymentTarget:
     tvOS: "17.0"
   createIntermediateGroups: true
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: JN4AC4DDAU
+    CODE_SIGN_STYLE: Automatic
 packages:
   # 轻量 HTTP server（纯 Swift、零传递依赖、tvOS 支持）。
   # 固定 stable 分支 revision，保证构建可复现。

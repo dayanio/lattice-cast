@@ -154,7 +154,8 @@ func TestByURLYouTubeWithFakeYtDlp(t *testing.T) {
 	assert.Equal(t, []string{"-f", "best[ext=mp4]/best", "-g", page}, recordedArgs(t, argsFile))
 }
 
-// TestByIDNASHappyPath 已知 media_id：返回 MediaURL(r.Base, id) 且 Kind=nas。
+// TestByIDNASHappyPath 已知 media_id：返回 MediaURL(r.Base, id)、Kind=nas，
+// 并带上库内片名（渲染端播放器标题栏用，留空会显示「未知」）。
 func TestByIDNASHappyPath(t *testing.T) {
 	lib, _ := newIndexedLib(t) // 复用 library_test.go 辅助：clip.mp4 已入库
 	base := "http://192.168.1.10:7810/"
@@ -163,7 +164,7 @@ func TestByIDNASHappyPath(t *testing.T) {
 
 	src, err := r.ByID(context.Background(), id)
 	require.NoError(t, err)
-	assert.Equal(t, Source{URL: lib.MediaURL(base, id), Kind: KindNAS}, src)
+	assert.Equal(t, Source{URL: lib.MediaURL(base, id), Kind: KindNAS, Title: "clip"}, src)
 	assert.Equal(t, "http://192.168.1.10:7810/media/"+id, src.URL, "应经 MediaURL 拼内网地址")
 }
 
